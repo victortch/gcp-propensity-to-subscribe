@@ -1,0 +1,50 @@
+
+# Thresholds policy for Economedia PTS
+# Strategy:
+# - Default: use the threshold chosen during training by expected F1 on validation.
+# - Optional per-label overrides below can enforce business constraints or a fixed threshold.
+# - If an override is provided, it replaces the trained threshold for inference.
+
+version: 1
+default:
+  selection_strategy: expected_f1      # how training picked thresholds
+  calibration: isotonic                # stored with artifacts; do not change here
+  fallback_threshold: 0.50             # used only if neither trained threshold nor override is available
+
+constraints:
+  # Optional global constraints the trainer may consider when multiple thresholds tie.
+  # These DO NOT override an explicit per-label 'fixed_threshold'.
+  min_precision: null                  # e.g., 0.25
+  min_recall: null                     # e.g., 0.15
+  min_positive_rate: null              # e.g., 0.01 (1% of scored users)
+
+labels:
+  # For each label you can either:
+  #   - leave override empty (use trained threshold), OR
+  #   - set fixed_threshold to pin a value, OR
+  #   - set min_precision/min_recall to guide selection if re-evaluated.
+  # If multiple controls are set, fixed_threshold wins.
+
+  cap_90d:
+    override:
+      fixed_threshold: null
+      min_precision: null
+      min_recall: null
+
+  dne_90d:
+    override:
+      fixed_threshold: null
+      min_precision: null
+      min_recall: null
+
+  cap_30d:
+    override:
+      fixed_threshold: null
+      min_precision: null
+      min_recall: null
+
+  dne_30d:
+    override:
+      fixed_threshold: null
+      min_precision: null
+      min_recall: null

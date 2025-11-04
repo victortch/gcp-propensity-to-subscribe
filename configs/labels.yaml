@@ -1,0 +1,26 @@
+# Labels configuration for Economedia PTS
+# These labels are used by training (cv_build/train) and daily inference.
+# You can disable any label by setting enabled: false.
+
+primary_label: cap_30d   # used by some scripts for default plots/summaries
+
+labels:
+  - id: cap_90d
+    enabled: true
+    horizon_days: 90
+    description: "Capital subscription within 90 days"
+
+  - id: dne_90d
+    enabled: true
+    horizon_days: 90
+    description: "Dnevnik subscription within 90 days"
+
+  - id: cap_30d
+    enabled: true
+    horizon_days: 30
+    description: "Capital subscription within 30 days"
+
+  - id: dne_30d
+    enabled: true
+    horizon_days: 30
+    description: "Dnevnik subscription within 30 days"
