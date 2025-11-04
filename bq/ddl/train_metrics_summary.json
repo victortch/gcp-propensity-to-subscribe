@@ -1,0 +1,8 @@
+[
+  {"name": "run_id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "label_tag", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "auc_val_mean", "type": "FLOAT", "mode": "REQUIRED"},
+  {"name": "threshold_expected", "type": "FLOAT", "mode": "REQUIRED"},
+  {"name": "params_json", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "created_at", "type": "TIMESTAMP", "mode": "REQUIRED"}
+]

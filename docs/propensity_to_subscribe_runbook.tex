@@ -1,0 +1,443 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\geometry{margin=1in}
+\setlist[itemize]{noitemsep, topsep=2pt}
+\setlist[enumerate]{noitemsep, topsep=2pt}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\begin{document}
+\title{Economedia Propensity-to-Subscribe Platform\\Comprehensive Runbook}
+\author{}
+\date{\today}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Executive Summary}
+The Economedia Propensity-to-Subscribe (PTS) engine delivers calibrated probabilities that a registered reader will subscribe to Capital or Dnevnik within future windows of 30 and 90 days. The platform preserves the analytical rigor of the on-premise Python workflow while introducing cloud-native automation on Google Cloud Platform (GCP). Vertex AI orchestrates quarterly training and daily batch inference jobs, BigQuery is both the system of record for source and model outputs, Cloud Storage retains model artifacts, and Cloud Workflows with Cloud Scheduler provide reliable automation. This document captures the end-to-end architecture and enumerates the remaining infrastructure steps (Steps~61--131 in \texttt{all-steps-to-deploy.txt}) required to bring the deployment to production readiness.
+
+\section{Model Overview}
+\subsection{Business Objective}
+The PTS model estimates the likelihood that a user will accept a paywall offer for Capital or Dnevnik. Four binary targets are modeled simultaneously:
+\begin{itemize}
+  \item \texttt{cap\_90d} --- Capital subscription within 90 days.
+  \item \texttt{dne\_90d} --- Dnevnik subscription within 90 days.
+  \item \texttt{cap\_30d} --- Capital subscription within 30 days.
+  \item \texttt{dne\_30d} --- Dnevnik subscription within 30 days.
+\end{itemize}
+The calibrated probabilities support marketing prioritization, retention programs, and editorial targeting.
+
+\subsection{Feature Engineering}
+Feature creation adheres to the legacy logic in \texttt{original\_files/data\_engineering7.py} while using parameterised SQL and orchestrated jobs:
+\begin{itemize}
+  \item \textbf{Training and backfill}: \texttt{app/training/sql/build\_training\_dataset.sql} materialises the \texttt{train\_data} and \texttt{cv\_build\_metadata} tables for arbitrary historical windows. Parameters include \texttt{start\_date}, \texttt{freeze\_date}, \texttt{dne\_start}, and \texttt{cap\_wall1\_offer\_start}. Output schemas match the legacy workflow to guarantee comparable metrics.
+  \item \textbf{Daily scoring features}: \texttt{bq/scheduled\_queries/features\_daily.sql} constructs \texttt{propensity\_to\_subscribe.features\_daily}. Each run ingests all sources through the scoring date, applies eligibility filters, and exports the full inference feature vector per user.
+\end{itemize}
+
+\subsection{Modelling Pipeline}
+The trainer in \texttt{app/training/train.py} mirrors \texttt{original\_files/model\_training\_local4.py}:
+\begin{itemize}
+  \item Bayesian optimisation over XGBoost hyperparameters with cross-validation folds generated from \texttt{cv\_build\_metadata}.
+  \item Feature scaling, missing value handling, and class weighting consistent with the historical notebooks.
+  \item Isotonic calibration on hold-out folds per label.
+  \item Global decision thresholds chosen by expected F1 from validation curves.
+  \item Metrics (AUROC, log loss, precision/recall, calibration plots) exported to both Cloud Storage and BigQuery via \texttt{app/training/metrics\_to\_bq.py}.
+\end{itemize}
+Artifacts written to \texttt{gs://economedia-pts-models} include trained boosters, calibration models, metric JSON, run manifests, and Matplotlib figures.
+
+\section{Platform Architecture}
+\subsection{Data Warehouse}
+BigQuery is the authoritative store for all inputs and outputs. Source data resides in \texttt{economedia-data-prod-laoy.*}, while derived assets live in the dedicated \texttt{propensity\_to\_subscribe} dataset:
+\begin{itemize}
+  \item \texttt{train\_data}: snapshot of labelled training rows.
+  \item \texttt{cv\_build\_metadata}: fold assignments and temporal cut-offs.
+  \item \texttt{features\_daily}: inference features partitioned by \texttt{scoring\_date}.
+  \item \texttt{predictions\_daily}: calibrated predictions and binary decisions partitioned by \texttt{scoring\_date}.
+  \item \texttt{train\_metrics}: summary and per-fold evaluation metrics.
+\end{itemize}
+
+\subsection{Training Workflow}
+A Vertex AI Custom Job executes \texttt{app/training/entrypoint.py}. The container:
+\begin{enumerate}
+  \item Executes the training dataset SQL with run-specific parameters.
+  \item Launches cross-validation, hyperparameter search, model fitting, and calibration.
+  \item Uploads artifacts to Cloud Storage and registers a version in Vertex AI Model Registry (repository \texttt{pts\_model} in region \texttt{europe-west3}).
+  \item Writes metrics to BigQuery and updates run metadata tables.
+\end{enumerate}
+
+\subsection{Inference Workflow}
+A separate Vertex AI Custom Job executes \texttt{app/inference/entrypoint.py}. At runtime it:
+\begin{enumerate}
+  \item Resolves the latest \texttt{stage=production} model from Model Registry.
+  \item Downloads artifacts from Cloud Storage.
+  \item Reads \texttt{features\_daily} for the requested \texttt{scoring\_date}.
+  \item Produces calibrated probabilities, derives the binary decision column, and writes to \texttt{predictions\_daily}. A JSON run manifest is persisted in Cloud Storage.
+\end{enumerate}
+
+\subsection{Orchestration and Scheduling}
+Two Cloud Workflows definitions \texttt{workflows/training\_workflow.yaml} and \texttt{workflows/inference\_workflow.yaml} orchestrate the Vertex jobs. Cloud Scheduler triggers them (quarterly and daily respectively) with explicit payloads. The daily feature SQL runs as a BigQuery Scheduled Query.
+
+\subsection{CI/CD and Images}
+Cloud Build triggers \texttt{cloudbuild.training.yaml} and \texttt{cloudbuild.inference.yaml} to build container images from \texttt{containers/training.Dockerfile} and \texttt{containers/inference.Dockerfile}. Artifacts publish to Artifact Registry repository \texttt{pts\_model} in \texttt{europe-west3}.
+
+\subsection{Security and IAM}
+Three service accounts enforce least privilege:
+\begin{itemize}
+  \item \textbf{sa-ml-train}: launches Vertex AI training jobs, queries BigQuery, and manages artifacts in Cloud Storage.
+  \item \textbf{sa-ml-infer}: launches inference jobs, reads features, and writes predictions.
+  \item \textbf{sa-workflows}: executes Workflows and impersonates the training/inference service accounts.
+\end{itemize}
+Dataset-level roles and bucket ACLs align with read/write responsibilities, while Cloud Build receives Artifact Registry writer access for image publication.
+
+\subsection{Observability}
+Logs from Vertex jobs stream to Cloud Logging. Cloud Monitoring alert policies cover Vertex job failures, Workflow failures, scheduled query failures, and zero-prediction anomalies. Budgets provide early visibility into cost regressions.
+
+\section{Operational Flow}
+Figure~\ref{fig:pipeline} summarises the data movement (omitted in print). The steady-state cadence is:
+\begin{enumerate}
+  \item Daily: BigQuery scheduled query produces \texttt{features\_daily}.
+  \item Daily: Cloud Scheduler triggers \texttt{inference\_workflow} to score the fresh features.
+  \item Quarterly: Cloud Scheduler triggers \texttt{training\_workflow}, delivering refreshed models and metrics.
+  \item Continuous: Cloud Build rebuilds images upon \texttt{main} updates.
+  \item As needed: Analysts interrogate BigQuery tables and Cloud Storage artifacts.
+\end{enumerate}
+
+\section{Deployment Steps (61--131)}
+This section provides copy-pasteable commands for the outstanding deployment work. Set the following environment variables once per shell session:
+\begin{verbatim}
+export PROJECT_ID=economedia-data-prod-laoy
+export REGION=europe-west3
+export ARTIFACT_REPO=pts_model
+export BUCKET=gs://economedia-pts-models
+\end{verbatim}
+Unless noted, run commands from a workstation authenticated with the target project.
+
+\subsection{Phase 1 — Enable Required APIs (61--72)}
+\begin{verbatim}
+gcloud services enable \
+  aiplatform.googleapis.com \
+  bigquery.googleapis.com \
+  bigquerystorage.googleapis.com \
+  bigquerydatatransfer.googleapis.com \
+  artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com \
+  storage.googleapis.com \
+  workflows.googleapis.com \
+  cloudscheduler.googleapis.com \
+  logging.googleapis.com \
+  monitoring.googleapis.com \
+  compute.googleapis.com --project=${PROJECT_ID}
+\end{verbatim}
+
+\subsection{Phase 2 — Service Accounts (73--75)}
+\begin{verbatim}
+gcloud iam service-accounts create sa-ml-train \
+  --project=${PROJECT_ID} \
+  --display-name="PTS Vertex Training"
+
+gcloud iam service-accounts create sa-ml-infer \
+  --project=${PROJECT_ID} \
+  --display-name="PTS Vertex Inference"
+
+gcloud iam service-accounts create sa-workflows \
+  --project=${PROJECT_ID} \
+  --display-name="PTS Workflows Orchestrator"
+\end{verbatim}
+
+\subsection{Phase 3 — IAM Bindings (76--86)}
+\paragraph{Project-level roles}
+\begin{verbatim}
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.reader"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.reader"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+\end{verbatim}
+\paragraph{Service account impersonation}
+\begin{verbatim}
+gcloud iam service-accounts add-iam-policy-binding \
+  sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com \
+  --member="serviceAccount:sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser"
+
+gcloud iam service-accounts add-iam-policy-binding \
+  sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com \
+  --member="serviceAccount:sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser"
+\end{verbatim}
+\paragraph{Cloud Build permissions}
+\begin{verbatim}
+CLOUDBUILD_SA=$(gcloud projects describe ${PROJECT_ID} \
+  --format="value(projectNumber)")@cloudbuild.gserviceaccount.com
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  --member="serviceAccount:${CLOUDBUILD_SA}" \
+  --role="roles/artifactregistry.writer"
+\end{verbatim}
+
+\subsection{Phase 4 — Storage, Dataset, and Tables (87--93)}
+\begin{verbatim}
+gcloud artifacts repositories create ${ARTIFACT_REPO} \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --repository-format=docker \
+  --description="PTS containers"
+
+gsutil mb -p ${PROJECT_ID} -l ${REGION} ${BUCKET}
+
+gsutil requester-pays set off ${BUCKET}
+
+bq --location=${REGION} --project_id=${PROJECT_ID} mk --dataset propensity_to_subscribe
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  < bq/ddl/create_predictions_daily.sql
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  < bq/ddl/create_train_metrics.sql
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  < bq/ddl/create_feature_views.sql
+\end{verbatim}
+
+\subsection{Phase 5 — Dataset-level IAM (94--100)}
+\begin{verbatim}
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  "GRANT SELECT ON DATASET `economedia-data-prod-laoy.public`
+     TO \"serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com\""
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  "GRANT SELECT ON DATASET `economedia-data-prod-laoy.ecommerce`
+     TO \"serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com\""
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  "GRANT SELECT ON DATASET `${PROJECT_ID}.propensity_to_subscribe`
+     TO \"serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com\""
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+  "GRANT SELECT, INSERT, UPDATE, DELETE ON DATASET `${PROJECT_ID}.propensity_to_subscribe`
+     TO \"serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com\""
+
+gsutil iam ch serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com:objectAdmin ${BUCKET}
+
+gsutil iam ch serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com:objectViewer ${BUCKET}
+\end{verbatim}
+(Use \texttt{bq show --format=prettyjson} to verify existing bindings before and after the GRANT statements.)
+
+\subsection{Phase 6 — Local Configuration (101--102)}
+Copy the environment template and commit:
+\begin{verbatim}
+cp configs/env.example.yaml configs/env.yaml
+# Edit credentials, dataset overrides, and registry settings as needed.
+
+git add configs/env.yaml
+
+git commit -m "Add project-specific environment configuration"
+\end{verbatim}
+
+\subsection{Phase 7 — Build and Publish Images (103--104)}
+\begin{verbatim}
+gcloud builds submit --project=${PROJECT_ID} \
+  --config=cloudbuild/cloudbuild.training.yaml .
+
+gcloud builds submit --project=${PROJECT_ID} \
+  --config=cloudbuild/cloudbuild.inference.yaml .
+\end{verbatim}
+Confirm the resulting images exist in \texttt{${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/training:latest} and \texttt{.../inference:latest}.
+
+\subsection{Phase 8 — Deploy Workflows (105--108)}
+\begin{verbatim}
+gcloud workflows deploy training_workflow \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --source=workflows/training_workflow.yaml \
+  --service-account=sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com
+
+gcloud workflows deploy inference_workflow \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --source=workflows/inference_workflow.yaml \
+  --service-account=sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com
+\end{verbatim}
+
+\subsection{Phase 9 — Cloud Scheduler Jobs (109--110)}
+\begin{verbatim}
+gcloud scheduler jobs create http training-quarterly \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --schedule="0 6 1 JAN,APR,JUL,OCT *" \
+  --time-zone="Europe/Sofia" \
+  --uri="https://${REGION}-workflowexecutions.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/workflows/training_workflow/executions" \
+  --oauth-service-account-email=sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com \
+  --message-body='{"run_id": "${PROJECT_ID}-quarterly"}'
+
+gcloud scheduler jobs create http inference-daily \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --schedule="0 4 * * *" \
+  --time-zone="Europe/Sofia" \
+  --uri="https://${REGION}-workflowexecutions.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/workflows/inference_workflow/executions" \
+  --oauth-service-account-email=sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com \
+  --message-body='{"scoring_date": "${YESTERDAY}"}'
+\end{verbatim}
+Set \texttt{YESTERDAY} via a scheduler parameter or update the Workflow to compute it automatically.
+
+\subsection{Phase 10 — BigQuery Scheduled Query (111--114)}
+\begin{verbatim}
+QUERY_BODY=$(tr '\n' ' ' < bq/scheduled_queries/features_daily.sql)
+
+# Requires jq for parsing JSON responses
+TRANSFER_CONFIG=$(bq mk --transfer_config \
+  --project_id=${PROJECT_ID} \
+  --data_source=scheduled_query \
+  --target_dataset=propensity_to_subscribe \
+  --display_name="PTS Daily Features" \
+  --location=${REGION} \
+  --params="{\"query\": \"${QUERY_BODY}\", \"destination_table_name_template\": \"features_daily\", \"partitioning_field\": \"scoring_date\", \"write_disposition\": \"WRITE_TRUNCATE\"}" \
+  --format=json | jq -r '.name')
+
+bq update --transfer_config --params '{"time_zone": "Europe/Sofia"}' ${TRANSFER_CONFIG}
+
+bq update --transfer_config --params '{"schedule": "every 24 hours"}' ${TRANSFER_CONFIG}
+\end{verbatim}
+Ensure the scheduled query service account has dataset write permissions (BigQuery UI shows the SA email upon creation).
+
+\subsection{Phase 11 — First Training Run (115--118)}
+\begin{verbatim}
+gcloud workflows executions run training_workflow \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --data='{"run_id": "bootstrap-$(date +%Y%m%d)"}'
+\end{verbatim}
+Monitor the execution in Cloud Console. After success:
+\begin{itemize}
+  \item Confirm artifacts under \texttt{${BUCKET}/training/}.
+  \item Inspect BigQuery \texttt{train\_metrics} for the new \texttt{run\_id}.
+  \item In Vertex Model Registry, verify a model version exists with metadata (run ID, SQL SHA, data window).
+  \item Apply the label \texttt{stage=candidate} using either the console or:
+\end{itemize}
+\begin{verbatim}
+gcloud ai models update VERSION_ID \
+  --project=${PROJECT_ID} \
+  --region=${REGION} \
+  --update-labels=stage=candidate
+\end{verbatim}
+
+\subsection{Phase 12 — Promotion (119--120)}
+\begin{verbatim}
+MODEL_ID=$(gcloud ai models list --project=${PROJECT_ID} --region=${REGION} \
+  --filter="displayName=pts-model" --format="value(name)")
+
+VERSION_ID=$(gcloud ai model-versions list ${MODEL_ID} \
+  --project=${PROJECT_ID} --region=${REGION} \
+  --filter="labels.stage=candidate" --sort-by=~createTime --limit=1 \
+  --format="value(name)")
+
+gcloud ai model-versions update ${VERSION_ID} \
+  --project=${PROJECT_ID} --region=${REGION} \
+  --update-labels=stage=production
+
+echo "Promoted version: ${VERSION_ID}" > promotion_record.txt
+\end{verbatim}
+Store \texttt{promotion\_record.txt} in version control for auditability.
+
+\subsection{Phase 13 — First Inference Run (121--122)}
+\begin{verbatim}
+SCORING_DATE=$(date -u -d "yesterday" +%Y-%m-%d)
+
+gcloud workflows executions run inference_workflow \
+  --project=${PROJECT_ID} \
+  --location=${REGION} \
+  --data="{\"scoring_date\": \"${SCORING_DATE}\"}"
+\end{verbatim}
+Validate BigQuery rows:
+\begin{verbatim}
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} \
+  "SELECT COUNT(*) AS predictions
+     FROM `${PROJECT_ID}.propensity_to_subscribe.predictions_daily`
+    WHERE scoring_date = '${SCORING_DATE}'"
+\end{verbatim}
+
+\subsection{Phase 14 — Monitoring and Budgets (123--127)}
+Budgets and alert policies can be scripted via \texttt{gcloud alpha billing budgets} and \texttt{gcloud monitoring policies}. Minimal examples:
+\begin{verbatim}
+gcloud alpha billing budgets create \
+  --billing-account=XXXX-XXXX-XXXX-XXXX \
+  --display-name="PTS Deployment" \
+  --budget-amount=1000 --threshold-rule-percentage=0.8
+
+gcloud monitoring policies create --policy-from-file=configs/alerts/vertex_failures.json
+
+gcloud monitoring policies create --policy-from-file=configs/alerts/workflow_failures.json
+
+gcloud monitoring policies create --policy-from-file=configs/alerts/bq_scheduled_query_failures.json
+
+gcloud monitoring policies create --policy-from-file=configs/alerts/zero_predictions.json
+\end{verbatim}
+Adjust notification channels and thresholds as required.
+
+\subsection{Phase 15 — Housekeeping (128--131)}
+\begin{verbatim}
+bq update --table ${PROJECT_ID}:propensity_to_subscribe.predictions_daily \
+  --set_expiration 7776000   # 90 days in seconds
+
+bq update --table ${PROJECT_ID}:propensity_to_subscribe.features_daily \
+  --set_expiration 7776000
+
+git tag v1.0.0
+
+git push origin main --tags
+
+# Update README with the runbook link (pointing to the generated PDF).
+# Example snippet:
+#   Runbook: docs/propensity_to_subscribe_runbook.pdf
+
+git add README.md
+
+git commit -m "Document runbook link"
+\end{verbatim}
+
+\section{Verification Checklist}
+After completing Steps~61--131, perform the following validation:
+\begin{enumerate}
+  \item \textbf{Static checks}: \texttt{python -m compileall app} to ensure there are no syntax errors before deploying new images.
+  \item \textbf{Scheduled query dry run}: Execute \texttt{bq query --dry\_run=true} on \texttt{bq/scheduled\_queries/features\_daily.sql} to confirm costs and correctness.
+  \item \textbf{Training smoke test}: Review Vertex AI job logs for warnings; confirm evaluation metrics align with historical baselines in BigQuery.
+  \item \textbf{Inference sanity}: Compare probability distributions across consecutive days; investigate if zero predictions are produced.
+  \item \textbf{Monitoring}: Trigger test alerts (e.g., disable a Workflow briefly) to verify notification channels.
+\end{enumerate}
+
+\section{Document Maintenance}
+Compile this \LaTeX{} source with \texttt{pdflatex docs/propensity\_to\_subscribe\_runbook.tex}. Store the generated PDF alongside the source and update the README link whenever the runbook is refreshed.
+
+\end{document}

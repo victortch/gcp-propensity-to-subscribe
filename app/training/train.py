@@ -17,19 +17,30 @@ in later steps (artifact_io.py, metrics_to_bq.py), without changing training mat
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from bayes_opt import BayesianOptimization
 import xgboost as xgb
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, precision_recall_fscore_support
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    log_loss,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
 
 from google.cloud import bigquery
 
@@ -72,13 +83,13 @@ def latest_run_id(client: bigquery.Client) -> str:
     sql = f"""
     SELECT run_id
     FROM `{TABLE_META}`
-    ORDER BY created_at DESC
+    ORDER BY run_started_at DESC
     LIMIT 1
     """
-    rows = list(client.query(sql).result())
-    if not rows:
+    df = client.query(sql).result().to_dataframe()
+    if df.empty:
         raise RuntimeError("No run_id found in cv_build_metadata.")
-    return rows[0]["run_id"]
+    return str(df.iloc[0]["run_id"])
 
 
 def load_train_table(client: bigquery.Client, run_id: str, label_tag: str) -> pd.DataFrame:
@@ -123,14 +134,14 @@ def load_meta_counts(client: bigquery.Client, run_id: str, label_tag: str) -> pd
 # Metrics / expected counts
 # -----------------------
 
-def class_weights_from_counts(y_val: pd.Series, pos_true: int, neg_true: int) -> np.ndarray:
-    """Weight each example to reflect expected positives/negatives."""
-    pos_obs = max(int((y_val == 1).sum()), 1)
-    neg_obs = max(int((y_val == 0).sum()), 1)
+def class_weights_from_counts(y_true: np.ndarray | pd.Series, pos_true: int, neg_true: int) -> np.ndarray:
+    """Weights so the weighted positives/negatives match natural counts."""
+    arr = np.asarray(y_true)
+    pos_obs = max(int((arr == 1).sum()), 1)
+    neg_obs = max(int((arr == 0).sum()), 1)
     w_pos = pos_true / pos_obs
     w_neg = neg_true / neg_obs
-    w = np.where(y_val.values == 1, w_pos, w_neg)
-    return w
+    return np.where(arr == 1, w_pos, w_neg).astype("float64")
 
 
 def best_expected_f1_threshold_global(
@@ -165,6 +176,268 @@ def best_expected_f1_threshold_global(
 
 
 # -----------------------
+# Metrics helpers & visualization
+# -----------------------
+
+def ks_statistic(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    df = pd.DataFrame({"y": y_true, "p": y_prob}).sort_values("p")
+    pos = (df["y"] == 1).cumsum() / max((df["y"] == 1).sum(), 1)
+    neg = (df["y"] == 0).cumsum() / max((df["y"] == 0).sum(), 1)
+    return float((pos - neg).abs().max())
+
+
+def weighted_logloss(y_true: np.ndarray, y_prob: np.ndarray, w: np.ndarray) -> float:
+    return float(log_loss(y_true, y_prob, sample_weight=w, labels=[0, 1]))
+
+
+def weighted_brier(y_true: np.ndarray, y_prob: np.ndarray, w: np.ndarray) -> float:
+    return float(np.average((y_true - y_prob) ** 2, weights=w))
+
+
+def expected_counts_from_rates(tpr: float, fpr: float, pos_true: int, neg_true: int) -> Tuple[float, float, float, float]:
+    tp = tpr * pos_true
+    fn = (1.0 - tpr) * pos_true
+    fp = fpr * neg_true
+    tn = (1.0 - fpr) * neg_true
+    return tp, fp, tn, fn
+
+
+def expected_threshold_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    thr: float,
+    pos_true: int,
+    neg_true: int,
+) -> Dict[str, float]:
+    """Expected confusion & derived metrics at ``thr`` for true prevalence."""
+
+    pred = (y_prob >= thr).astype(int)
+    tn_s, fp_s, fn_s, tp_s = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+    pos_s = max(1, int((y_true == 1).sum()))
+    neg_s = max(1, int((y_true == 0).sum()))
+    tpr = tp_s / pos_s
+    fpr = fp_s / neg_s
+
+    tp, fp, tn, fn = expected_counts_from_rates(tpr, fpr, pos_true, neg_true)
+    n_true = pos_true + neg_true
+    prec = tp / max(tp + fp, 1e-12)
+    rec = tp / max(tp + fn, 1e-12)
+    acc = (tp + tn) / max(n_true, 1e-12)
+    f1 = (2 * prec * rec) / max(prec + rec, 1e-12)
+
+    return {
+        "exp_tp": float(tp),
+        "exp_fp": float(fp),
+        "exp_tn": float(tn),
+        "exp_fn": float(fn),
+        "exp_precision": float(prec),
+        "exp_recall": float(rec),
+        "exp_accuracy": float(acc),
+        "exp_f1": float(f1),
+        "tpr": float(tpr),
+        "fpr": float(fpr),
+    }
+
+
+def prob_metrics(y_true: np.ndarray, y_prob: np.ndarray, w: Optional[np.ndarray] = None) -> Dict[str, float]:
+    try:
+        auc = float(roc_auc_score(y_true, y_prob))
+    except Exception:
+        auc = 0.5
+    if w is None:
+        pr_auc = float(average_precision_score(y_true, y_prob))
+        ll = float(log_loss(y_true, y_prob, labels=[0, 1]))
+        br = float(brier_score_loss(y_true, y_prob))
+    else:
+        pr_auc = float(average_precision_score(y_true, y_prob, sample_weight=w))
+        ll = weighted_logloss(y_true, y_prob, w)
+        br = weighted_brier(y_true, y_prob, w)
+    return {"auc": auc, "pr_auc": pr_auc, "logloss": ll, "brier": br}
+
+
+def random_baseline_expected_metrics(rate_pred: float, pos_true: int, neg_true: int) -> Dict[str, float]:
+    tp = rate_pred * pos_true
+    fp = rate_pred * neg_true
+    fn = (1 - rate_pred) * pos_true
+    tn = (1 - rate_pred) * neg_true
+    n = pos_true + neg_true
+    prec = tp / max(tp + fp, 1e-12)
+    rec = tp / max(tp + fn, 1e-12)
+    acc = (tp + tn) / max(n, 1e-12)
+    f1 = (2 * prec * rec) / max(prec + rec, 1e-12)
+    return {
+        "tp": float(tp),
+        "fp": float(fp),
+        "tn": float(tn),
+        "fn": float(fn),
+        "precision": float(prec),
+        "recall": float(rec),
+        "accuracy": float(acc),
+        "f1": float(f1),
+    }
+
+
+def plot_roc(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_path: Path):
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    pred = (y_prob >= thr).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+    tpr_point = tp / max(tp + fn, 1e-12)
+    fpr_point = fp / max(fp + tn, 1e-12)
+
+    plt.figure()
+    plt.plot(fpr, tpr, label="Model ROC")
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
+    plt.scatter([fpr_point], [tpr_point], marker="o", label=f"Thr={thr:.3f}")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve (test)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_pr(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_path: Path):
+    prec, rec, _ = precision_recall_curve(y_true, y_prob)
+    prevalence = float(np.mean(y_true)) if len(y_true) else 0.0
+    pred = (y_prob >= thr).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+    prec_point = tp / max(tp + fp, 1e-12)
+    rec_point = tp / max(tp + fn, 1e-12)
+
+    plt.figure()
+    plt.plot(rec, prec, label="Model PR")
+    plt.hlines(prevalence, 0, 1, linestyles="--", label=f"Baseline (prev={prevalence:.3%})")
+    plt.scatter([rec_point], [prec_point], marker="o", label=f"Thr={thr:.3f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision–Recall Curve (test)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_calibration(calib_df: pd.DataFrame, mean_pred_col: str, rate_col: str, out_path: Path, title: str):
+    plt.figure()
+    x = calib_df[mean_pred_col].values
+    y = calib_df[rate_col].values
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Perfect")
+    plt.scatter(x, y, label="Bins")
+    plt.xlabel("Predicted probability")
+    plt.ylabel("Observed rate")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_lift(tbl: pd.DataFrame, x_col: str, y_col: str, out_path: Path, title: str):
+    plt.figure()
+    plt.plot(tbl[x_col], tbl[y_col], marker="o", label="Model")
+    plt.hlines(1.0, tbl[x_col].min(), tbl[x_col].max(), linestyles="--", label="Baseline")
+    plt.xlabel("Decile (10=top)")
+    plt.ylabel("Lift")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def _annotate_cm(ax, cm: np.ndarray):
+    ax.imshow(cm, interpolation="nearest")
+    for (i, j), v in np.ndenumerate(cm):
+        if float(v).is_integer():
+            txt = f"{int(v)}"
+        else:
+            txt = f"{v:.1f}"
+        ax.text(j, i, txt, ha="center", va="center", fontsize=9)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["Pred 0", "Pred 1"])
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["True 0", "True 1"])
+
+
+def plot_confusions_side_by_side(cm_left: np.ndarray, cm_right: np.ndarray, titles: Tuple[str, str], out_path: Path, suptitle: str):
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    _annotate_cm(axes[0], cm_left)
+    axes[0].set_title(titles[0])
+    _annotate_cm(axes[1], cm_right)
+    axes[1].set_title(titles[1])
+    fig.suptitle(suptitle)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_score_hist(y_true: np.ndarray, y_prob: np.ndarray, out_path: Path, bins: int = 40):
+    plt.figure()
+    plt.hist(y_prob[y_true == 0], bins=bins, alpha=0.6, label="Negatives")
+    plt.hist(y_prob[y_true == 1], bins=bins, alpha=0.6, label="Positives")
+    plt.xlabel("Predicted probability")
+    plt.ylabel("Count")
+    plt.title("Score distribution by class (test)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_feature_importance(booster, out_path: Path, topn: int = 20):
+    fmap = booster.get_score(importance_type="gain") or booster.get_score(importance_type="weight")
+    items = sorted(fmap.items(), key=lambda kv: kv[1], reverse=True)[:topn]
+    if not items:
+        return
+    labels, vals = zip(*items)
+    plt.figure()
+    plt.barh(range(len(vals)), vals)
+    plt.yticks(range(len(vals)), labels)
+    plt.gca().invert_yaxis()
+    plt.xlabel("Importance")
+    plt.title(f"Top {topn} Feature Importances")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_metric_bars(model_metrics: Dict[str, float], baseline_metrics: Dict[str, float], title: str, out_path: Path):
+    metrics = ["precision", "recall", "accuracy", "f1"]
+    model_vals = [float(model_metrics.get(m, np.nan)) for m in metrics]
+    base_vals = [float(baseline_metrics.get(m, np.nan)) for m in metrics]
+    x = np.arange(len(metrics))
+    width = 0.38
+
+    plt.figure()
+    bars_model = plt.bar(x - width / 2, model_vals, width=width, label="Model")
+    bars_base = plt.bar(x + width / 2, base_vals, width=width, label="Random baseline")
+
+    def _autolabel(bars):
+        for b in bars:
+            h = b.get_height()
+            if np.isnan(h):
+                label = "NA"
+                h_plot = 0.0
+            else:
+                label = f"{h:.2f}"
+                h_plot = h
+            plt.text(b.get_x() + b.get_width() / 2, h_plot + 0.01, label, ha="center", va="bottom", fontsize=9)
+
+    _autolabel(bars_model)
+    _autolabel(bars_base)
+
+    plt.xticks(x, [m.capitalize() for m in metrics])
+    plt.ylim(0, 1.05)
+    plt.ylabel("Score")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+# -----------------------
 # Trainer
 # -----------------------
 
@@ -184,6 +457,7 @@ class LabelTrainer:
         self.out_dir = out_dir / label_tag
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
+        self.logger = get_logger(f"pts.training.{label_tag}")
         self.client = get_bq_client(project=PROJECT_ID, location=BQ_LOCATION)
         self.run_id = latest_run_id(self.client)
 
@@ -195,6 +469,7 @@ class LabelTrainer:
         self.model: Optional[xgb.XGBClassifier] = None
         self.calibrator: Optional[IsotonicRegression] = None
         self.val_thr_expected: Optional[float] = None
+        self.metrics_df: Optional[pd.DataFrame] = None
 
     # ---------- load data ----------
 
@@ -213,6 +488,13 @@ class LabelTrainer:
 
         # Natural counts from metadata
         self.meta_counts = load_meta_counts(self.client, self.run_id, self.label_tag)
+        self.logger.info(
+            "Loaded training data for label=%s run_id=%s | folds=%s | test_rows=%s",
+            self.label_tag,
+            self.run_id,
+            len(self.folds),
+            len(self.test_df) if self.test_df is not None else 0,
+        )
 
     # ---------- bayesian optimization ----------
 
@@ -335,12 +617,376 @@ class LabelTrainer:
 
     # ---------- evaluation helpers ----------
 
+    def evaluate_and_save(self) -> Dict[str, Any]:
+        if self.model is None or self.calibrator is None or self.val_thr_expected is None:
+            raise RuntimeError("Model must be trained and calibrated before evaluation.")
+        if self.test_df is None:
+            raise RuntimeError("Test dataframe not loaded.")
+
+        metrics_rows: List[Dict[str, Any]] = []
+        thr = float(self.val_thr_expected)
+
+        # Per-fold validation metrics
+        for fold, (_, va_df) in sorted(self.folds.items()):
+            X_va, y_va = prepare_xy_compat(va_df, self.target_col)
+            y_val = y_va.astype(int)
+            p_raw = self.model.predict_proba(X_va)[:, 1]
+            p_cal = self.calibrator.transform(p_raw)
+
+            pred = (p_cal >= thr).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_val, pred, labels=[0, 1]).ravel()
+            auc = roc_auc_score(y_val, p_cal)
+            pr_auc = average_precision_score(y_val, p_cal)
+            logloss_ = log_loss(y_val, p_cal, labels=[0, 1])
+            brier = brier_score_loss(y_val, p_cal)
+            ks = ks_statistic(y_val.values, p_cal)
+            prec_obs = tp / max(tp + fp, 1e-12)
+            rec_obs = tp / max(tp + fn, 1e-12)
+            acc_obs = (tp + tn) / max(len(y_val), 1e-12)
+            f1_obs = (2 * prec_obs * rec_obs) / max(prec_obs + rec_obs, 1e-12)
+
+            _, pos_true, neg_true = self._natural_counts("val", int(fold))
+            w = class_weights_from_counts(y_val.values, pos_true, neg_true)
+            exp = expected_threshold_metrics(y_val.values, p_cal, thr, pos_true, neg_true)
+            pr_auc_w = float(average_precision_score(y_val, p_cal, sample_weight=w))
+            logloss_w = weighted_logloss(y_val, p_cal, w)
+            brier_w = weighted_brier(y_val, p_cal, w)
+
+            p_base = pos_true / max(pos_true + neg_true, 1e-12)
+            base_obs = prob_metrics(y_val.values, np.full_like(p_cal, p_base), None)
+            base_obs["auc"] = 0.5
+            base_exp = prob_metrics(y_val.values, np.full_like(p_cal, p_base), w)
+            base_exp["auc"] = 0.5
+
+            rate_pred_obs = float(pred.mean())
+            base_cls_obs = random_baseline_expected_metrics(rate_pred_obs, pos_true=int((y_val == 1).sum()), neg_true=int((y_val == 0).sum()))
+            base_cls_exp = random_baseline_expected_metrics(rate_pred_obs, pos_true=pos_true, neg_true=neg_true)
+
+            row = dict(
+                run_id=self.run_id,
+                label=self.label_tag,
+                split="val",
+                fold=int(fold),
+                n=len(y_val),
+                pos=int(y_val.sum()),
+                neg=int((y_val == 0).sum()),
+                auc=float(auc),
+                pr_auc=float(pr_auc),
+                logloss=float(logloss_),
+                brier=float(brier),
+                ks=float(ks),
+                precision=float(prec_obs),
+                recall=float(rec_obs),
+                accuracy=float(acc_obs),
+                f1=float(f1_obs),
+                threshold=thr,
+                tp=int(tp),
+                fp=int(fp),
+                tn=int(tn),
+                fn=int(fn),
+                exp_pos=int(pos_true),
+                exp_neg=int(neg_true),
+                exp_pr_auc=float(pr_auc_w),
+                exp_logloss=float(logloss_w),
+                exp_brier=float(brier_w),
+                exp_tp=float(exp["exp_tp"]),
+                exp_fp=float(exp["exp_fp"]),
+                exp_tn=float(exp["exp_tn"]),
+                exp_fn=float(exp["exp_fn"]),
+                exp_precision=float(exp["exp_precision"]),
+                exp_recall=float(exp["exp_recall"]),
+                exp_accuracy=float(exp["exp_accuracy"]),
+                exp_f1=float(exp["exp_f1"]),
+                tpr=float(exp["tpr"]),
+                fpr=float(exp["fpr"]),
+                base_prob_obs_auc=float(base_obs["auc"]),
+                base_prob_obs_pr_auc=float(base_obs["pr_auc"]),
+                base_prob_obs_logloss=float(base_obs["logloss"]),
+                base_prob_obs_brier=float(base_obs["brier"]),
+                base_prob_exp_auc=float(base_exp["auc"]),
+                base_prob_exp_pr_auc=float(base_exp["pr_auc"]),
+                base_prob_exp_logloss=float(base_exp["logloss"]),
+                base_prob_exp_brier=float(base_exp["brier"]),
+                base_rand_obs_tp=float(base_cls_obs["tp"]),
+                base_rand_obs_fp=float(base_cls_obs["fp"]),
+                base_rand_obs_tn=float(base_cls_obs["tn"]),
+                base_rand_obs_fn=float(base_cls_obs["fn"]),
+                base_rand_obs_precision=float(base_cls_obs["precision"]),
+                base_rand_obs_recall=float(base_cls_obs["recall"]),
+                base_rand_obs_accuracy=float(base_cls_obs["accuracy"]),
+                base_rand_obs_f1=float(base_cls_obs["f1"]),
+                base_rand_exp_tp=float(base_cls_exp["tp"]),
+                base_rand_exp_fp=float(base_cls_exp["fp"]),
+                base_rand_exp_tn=float(base_cls_exp["tn"]),
+                base_rand_exp_fn=float(base_cls_exp["fn"]),
+                base_rand_exp_precision=float(base_cls_exp["precision"]),
+                base_rand_exp_recall=float(base_cls_exp["recall"]),
+                base_rand_exp_accuracy=float(base_cls_exp["accuracy"]),
+                base_rand_exp_f1=float(base_cls_exp["f1"]),
+                base_rate_pred=float(rate_pred_obs),
+                base_p_const=float(p_base),
+            )
+            metrics_rows.append(row)
+
+        # Test metrics
+        X_te, y_te = prepare_xy_compat(self.test_df, self.target_col)
+        y_test = y_te.astype(int)
+        p_raw_te = self.model.predict_proba(X_te)[:, 1]
+        p_te = self.calibrator.transform(p_raw_te)
+        pred_te = (p_te >= thr).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_test, pred_te, labels=[0, 1]).ravel()
+        auc_te = roc_auc_score(y_test, p_te)
+        pr_auc_te = average_precision_score(y_test, p_te)
+        logloss_te = log_loss(y_test, p_te, labels=[0, 1])
+        brier_te = brier_score_loss(y_test, p_te)
+        ks_te = ks_statistic(y_test.values, p_te)
+        prec_te = tp / max(tp + fp, 1e-12)
+        rec_te = tp / max(tp + fn, 1e-12)
+        acc_te = (tp + tn) / max(len(y_test), 1e-12)
+        f1_te = (2 * prec_te * rec_te) / max(prec_te + rec_te, 1e-12)
+
+        _, pos_true_te, neg_true_te = self._natural_counts("test", 0)
+        w_te = class_weights_from_counts(y_test.values, pos_true_te, neg_true_te)
+        exp_te = expected_threshold_metrics(y_test.values, p_te, thr, pos_true_te, neg_true_te)
+        pr_auc_te_w = float(average_precision_score(y_test, p_te, sample_weight=w_te))
+        logloss_te_w = weighted_logloss(y_test, p_te, w_te)
+        brier_te_w = weighted_brier(y_test, p_te, w_te)
+
+        p_base_te = pos_true_te / max(pos_true_te + neg_true_te, 1e-12)
+        base_obs_te = prob_metrics(y_test.values, np.full_like(p_te, p_base_te), None)
+        base_obs_te["auc"] = 0.5
+        base_exp_te = prob_metrics(y_test.values, np.full_like(p_te, p_base_te), w_te)
+        base_exp_te["auc"] = 0.5
+
+        rate_pred_te = float(pred_te.mean())
+        base_cls_obs_te = random_baseline_expected_metrics(rate_pred_te, pos_true=int((y_test == 1).sum()), neg_true=int((y_test == 0).sum()))
+        base_cls_exp_te = random_baseline_expected_metrics(rate_pred_te, pos_true=pos_true_te, neg_true=neg_true_te)
+
+        metrics_rows.append(
+            dict(
+                run_id=self.run_id,
+                label=self.label_tag,
+                split="test",
+                fold=0,
+                n=len(y_test),
+                pos=int(y_test.sum()),
+                neg=int((y_test == 0).sum()),
+                auc=float(auc_te),
+                pr_auc=float(pr_auc_te),
+                logloss=float(logloss_te),
+                brier=float(brier_te),
+                ks=float(ks_te),
+                precision=float(prec_te),
+                recall=float(rec_te),
+                accuracy=float(acc_te),
+                f1=float(f1_te),
+                threshold=thr,
+                tp=int(tp),
+                fp=int(fp),
+                tn=int(tn),
+                fn=int(fn),
+                exp_pos=int(pos_true_te),
+                exp_neg=int(neg_true_te),
+                exp_pr_auc=float(pr_auc_te_w),
+                exp_logloss=float(logloss_te_w),
+                exp_brier=float(brier_te_w),
+                exp_tp=float(exp_te["exp_tp"]),
+                exp_fp=float(exp_te["exp_fp"]),
+                exp_tn=float(exp_te["exp_tn"]),
+                exp_fn=float(exp_te["exp_fn"]),
+                exp_precision=float(exp_te["exp_precision"]),
+                exp_recall=float(exp_te["exp_recall"]),
+                exp_accuracy=float(exp_te["exp_accuracy"]),
+                exp_f1=float(exp_te["exp_f1"]),
+                tpr=float(exp_te["tpr"]),
+                fpr=float(exp_te["fpr"]),
+                base_prob_obs_auc=float(base_obs_te["auc"]),
+                base_prob_obs_pr_auc=float(base_obs_te["pr_auc"]),
+                base_prob_obs_logloss=float(base_obs_te["logloss"]),
+                base_prob_obs_brier=float(base_obs_te["brier"]),
+                base_prob_exp_auc=float(base_exp_te["auc"]),
+                base_prob_exp_pr_auc=float(base_exp_te["pr_auc"]),
+                base_prob_exp_logloss=float(base_exp_te["logloss"]),
+                base_prob_exp_brier=float(base_exp_te["brier"]),
+                base_rand_obs_tp=float(base_cls_obs_te["tp"]),
+                base_rand_obs_fp=float(base_cls_obs_te["fp"]),
+                base_rand_obs_tn=float(base_cls_obs_te["tn"]),
+                base_rand_obs_fn=float(base_cls_obs_te["fn"]),
+                base_rand_obs_precision=float(base_cls_obs_te["precision"]),
+                base_rand_obs_recall=float(base_cls_obs_te["recall"]),
+                base_rand_obs_accuracy=float(base_cls_obs_te["accuracy"]),
+                base_rand_obs_f1=float(base_cls_obs_te["f1"]),
+                base_rand_exp_tp=float(base_cls_exp_te["tp"]),
+                base_rand_exp_fp=float(base_cls_exp_te["fp"]),
+                base_rand_exp_tn=float(base_cls_exp_te["tn"]),
+                base_rand_exp_fn=float(base_cls_exp_te["fn"]),
+                base_rand_exp_precision=float(base_cls_exp_te["precision"]),
+                base_rand_exp_recall=float(base_cls_exp_te["recall"]),
+                base_rand_exp_accuracy=float(base_cls_exp_te["accuracy"]),
+                base_rand_exp_f1=float(base_cls_exp_te["f1"]),
+                base_rate_pred=float(rate_pred_te),
+                base_p_const=float(p_base_te),
+            )
+        )
+
+        metrics_df = pd.DataFrame(metrics_rows).sort_values(["split", "fold"])
+        metrics_csv_path = self.out_dir / "metrics_per_fold_and_test.csv"
+        metrics_df.to_csv(metrics_csv_path, index=False)
+        self.metrics_df = metrics_df
+
+        # Plots and supplementary tables (test set)
+        plot_roc(y_test.values, p_te, thr, self.out_dir / "roc_curve_test.png")
+        plot_pr(y_test.values, p_te, thr, self.out_dir / "pr_curve_test.png")
+
+        calib = self._calibration_bins(y_test.values, p_te, bins=20)
+        calib.to_csv(self.out_dir / "calibration_bins_test_observed.csv", index=False)
+        plot_calibration(calib, "mean_pred", "rate", self.out_dir / "calibration_test_observed.png", "Calibration (observed, test)")
+
+        calib_w = self._calibration_bins_weighted(y_test.values, p_te, w_te, bins=20)
+        calib_w.to_csv(self.out_dir / "calibration_bins_test_expected.csv", index=False)
+        plot_calibration(calib_w, "mean_pred_w", "rate_w", self.out_dir / "calibration_test_expected.png", "Calibration (expected, test)")
+
+        lift = self._lift_table(y_test.values, p_te, deciles=10)
+        lift.to_csv(self.out_dir / "lift_table_test_observed.csv", index=False)
+        plot_lift(lift, "decile", "lift", self.out_dir / "lift_test_observed.png", "Lift by decile (observed, test)")
+
+        lift_w = self._lift_table_weighted(y_test.values, p_te, w_te, deciles=10)
+        lift_w.to_csv(self.out_dir / "lift_table_test_expected.csv", index=False)
+        plot_lift(lift_w, "decile", "lift_w", self.out_dir / "lift_test_expected.png", "Lift by decile (expected, test)")
+
+        cm_obs_model = np.array([[tn, fp], [fn, tp]], dtype=float)
+        base_obs_cm = np.array([
+            [base_cls_obs_te["tn"], base_cls_obs_te["fp"]],
+            [base_cls_obs_te["fn"], base_cls_obs_te["tp"]],
+        ], dtype=float)
+        plot_confusions_side_by_side(cm_obs_model, base_obs_cm, ("Model (observed)", "Random baseline (observed)"), self.out_dir / "confusion_test_observed_side_by_side.png", "Confusion matrices (observed, test)")
+
+        cm_exp_model = np.array([
+            [exp_te["exp_tn"], exp_te["exp_fp"]],
+            [exp_te["exp_fn"], exp_te["exp_tp"]],
+        ], dtype=float)
+        cm_exp_base = np.array([
+            [base_cls_exp_te["tn"], base_cls_exp_te["fp"]],
+            [base_cls_exp_te["fn"], base_cls_exp_te["tp"]],
+        ], dtype=float)
+        plot_confusions_side_by_side(cm_exp_model, cm_exp_base, ("Model (expected)", "Random baseline (expected)"), self.out_dir / "confusion_test_expected_side_by_side.png", "Confusion matrices (expected, test)")
+
+        model_obs_metrics = {"precision": prec_te, "recall": rec_te, "accuracy": acc_te, "f1": f1_te}
+        base_obs_metrics = {k: base_cls_obs_te[k] for k in ["precision", "recall", "accuracy", "f1"]}
+        plot_metric_bars(model_obs_metrics, base_obs_metrics, "Classification metrics (observed, test)", self.out_dir / "classification_bars_test_observed.png")
+
+        model_exp_metrics = {
+            "precision": exp_te["exp_precision"],
+            "recall": exp_te["exp_recall"],
+            "accuracy": exp_te["exp_accuracy"],
+            "f1": exp_te["exp_f1"],
+        }
+        base_exp_metrics = {
+            "precision": base_cls_exp_te["precision"],
+            "recall": base_cls_exp_te["recall"],
+            "accuracy": base_cls_exp_te["accuracy"],
+            "f1": base_cls_exp_te["f1"],
+        }
+        plot_metric_bars(model_exp_metrics, base_exp_metrics, "Classification metrics (expected, test)", self.out_dir / "classification_bars_test_expected.png")
+
+        plot_score_hist(y_test.values, p_te, self.out_dir / "score_hist_test.png")
+        try:
+            plot_feature_importance(self.model.get_booster(), self.out_dir / "feature_importance_top20.png", topn=20)
+        except Exception:
+            pass
+
+        summary = {
+            "label": self.label_tag,
+            "best_params": self.best_params,
+            "threshold_chosen_on_validation_expectedF1": thr,
+            "observed_test": {
+                "auc": float(auc_te),
+                "pr_auc": float(pr_auc_te),
+                "logloss": float(logloss_te),
+                "brier": float(brier_te),
+                "ks": float(ks_te),
+                "precision": float(prec_te),
+                "recall": float(rec_te),
+                "accuracy": float(acc_te),
+                "f1": float(f1_te),
+                "n": int(len(y_test)),
+                "pos": int(y_test.sum()),
+                "neg": int((y_test == 0).sum()),
+                "baseline_const_prob": {
+                    "auc": 0.5,
+                    "pr_auc": float(base_obs_te["pr_auc"]),
+                    "logloss": float(base_obs_te["logloss"]),
+                    "brier": float(base_obs_te["brier"]),
+                },
+                "baseline_random_same_rate": {
+                    "rate_pred": rate_pred_te,
+                    "precision": float(base_cls_obs_te["precision"]),
+                    "recall": float(base_cls_obs_te["recall"]),
+                    "f1": float(base_cls_obs_te["f1"]),
+                    "accuracy": float(base_cls_obs_te["accuracy"]),
+                },
+            },
+            "expected_test": {
+                "pr_auc": float(pr_auc_te_w),
+                "logloss": float(logloss_te_w),
+                "brier": float(brier_te_w),
+                "f1": float(exp_te["exp_f1"]),
+                "precision": float(exp_te["exp_precision"]),
+                "recall": float(exp_te["exp_recall"]),
+                "accuracy": float(exp_te["exp_accuracy"]),
+                "tp": float(exp_te["exp_tp"]),
+                "fp": float(exp_te["exp_fp"]),
+                "tn": float(exp_te["exp_tn"]),
+                "fn": float(exp_te["exp_fn"]),
+                "baseline_const_prob": {
+                    "auc": 0.5,
+                    "pr_auc": float(base_exp_te["pr_auc"]),
+                    "logloss": float(base_exp_te["logloss"]),
+                    "brier": float(base_exp_te["brier"]),
+                },
+                "baseline_random_same_rate": {
+                    "rate_pred": rate_pred_te,
+                    "precision": float(base_cls_exp_te["precision"]),
+                    "recall": float(base_cls_exp_te["recall"]),
+                    "f1": float(base_cls_exp_te["f1"]),
+                    "accuracy": float(base_cls_exp_te["accuracy"]),
+                },
+            },
+            "run_id": self.run_id,
+        }
+
+        summary_path = self.out_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2))
+        self.logger.info(
+            "Saved evaluation artifacts for label=%s at %s",
+            self.label_tag,
+            self.out_dir,
+        )
+
+        return {
+            "metrics_df": metrics_df,
+            "metrics_csv": str(metrics_csv_path),
+            "summary": summary,
+            "summary_path": str(summary_path),
+        }
+
+    def _natural_counts(self, split: str, fold: int) -> Tuple[int, int, int]:
+        """Return (n, pos, neg) for the specified split/fold from metadata."""
+        if self.meta_counts is None:
+            raise RuntimeError("meta_counts not loaded.")
+        subset = self.meta_counts[(self.meta_counts["split"] == split) & (self.meta_counts["fold"] == fold)]
+        if subset.empty:
+            raise RuntimeError(f"No natural counts for label={self.label_tag} split={split} fold={fold}")
+        n = int(subset["n"].iloc[0])
+        pos = int(subset["pos"].iloc[0])
+        neg = int(subset["neg"].iloc[0])
+        return n, pos, neg
+
     def _natural_totals(self, split: str) -> Tuple[int, int]:
         """Return total expected positives/negatives across folds for a split."""
-        m = self.meta_counts
-        if m is None:
+        if self.meta_counts is None:
             raise RuntimeError("meta_counts not loaded.")
-        m2 = m[m["split"] == split]
+        m2 = self.meta_counts[self.meta_counts["split"] == split]
         pos_true = int(m2["pos"].sum())
         neg_true = int(m2["neg"].sum())
         return pos_true, neg_true
@@ -350,6 +996,49 @@ class LabelTrainer:
         pos = float((y == 1).sum())
         neg = float((y == 0).sum())
         return (neg / max(pos, 1.0))
+
+    def _calibration_bins(self, y_true: np.ndarray, y_prob: np.ndarray, bins: int = 20) -> pd.DataFrame:
+        df = pd.DataFrame({"y": y_true, "p": y_prob})
+        df["bin"] = pd.qcut(df["p"], q=bins, duplicates="drop")
+        return df.groupby("bin").agg(n=("y", "size"), mean_pred=("p", "mean"), rate=("y", "mean")).reset_index()
+
+    def _calibration_bins_weighted(self, y_true: np.ndarray, y_prob: np.ndarray, w: np.ndarray, bins: int = 20) -> pd.DataFrame:
+        df = pd.DataFrame({"y": y_true, "p": y_prob, "w": w})
+        df["bin"] = pd.qcut(df["p"], q=bins, duplicates="drop")
+        g = df.groupby("bin")
+        out = g.apply(lambda d: pd.Series({
+            "n_w": d["w"].sum(),
+            "mean_pred_w": np.average(d["p"], weights=d["w"]),
+            "rate_w": np.average(d["y"], weights=d["w"]),
+        })).reset_index()
+        return out
+
+    def _lift_table(self, y_true: np.ndarray, y_prob: np.ndarray, deciles: int = 10) -> pd.DataFrame:
+        df = pd.DataFrame({"y": y_true, "p": y_prob})
+        df["decile"] = pd.qcut(df["p"], q=deciles, labels=False, duplicates="drop")
+        tbl = df.groupby("decile").agg(
+            n=("y", "size"),
+            responders=("y", "sum"),
+            avg_score=("p", "mean"),
+            rate=("y", "mean"),
+        ).reset_index()
+        overall_rate = df["y"].mean() if len(df) else 0.0
+        tbl["lift"] = tbl["rate"] / max(overall_rate, 1e-12)
+        return tbl.sort_values("decile", ascending=False).reset_index(drop=True)
+
+    def _lift_table_weighted(self, y_true: np.ndarray, y_prob: np.ndarray, w: np.ndarray, deciles: int = 10) -> pd.DataFrame:
+        df = pd.DataFrame({"y": y_true, "p": y_prob, "w": w})
+        df["decile"] = pd.qcut(df["p"], q=deciles, labels=False, duplicates="drop")
+        g = df.groupby("decile")
+        tbl = g.apply(lambda d: pd.Series({
+            "n_w": d["w"].sum(),
+            "responders_w": np.sum(d["w"] * d["y"]),
+            "avg_score_w": np.average(d["p"], weights=d["w"]),
+            "rate_w": np.average(d["y"], weights=d["w"]),
+        })).reset_index()
+        overall_rate_w = np.average(y_true, weights=w) if len(df) else 0.0
+        tbl["lift_w"] = tbl["rate_w"] / max(overall_rate_w, 1e-12)
+        return tbl.sort_values("decile", ascending=False).reset_index(drop=True)
 
     # ---------- summarize ----------
 
@@ -425,12 +1114,15 @@ def run_training(
         trainer.bayes_optimize()
         logger.info("Fitting final model + calibration + threshold selection...")
         trainer.fit_final()
+        eval_outputs = trainer.evaluate_and_save()
         summary = trainer.summary()
         results["labels"][tag] = {
             "best_params": summary.best_params,
             "threshold_expected": summary.threshold_expected,
             "auc_val_mean": summary.auc_val_mean,
             "artifact_local_dir": summary.artifact_local_dir,
+            "metrics_csv": eval_outputs.get("metrics_csv"),
+            "summary_json": eval_outputs.get("summary_path"),
         }
 
         # Optional: if artifact_io is present (added in a later step), upload artifacts and register model
@@ -460,6 +1152,14 @@ def run_training(
                     threshold_expected=summary.threshold_expected,
                     params=summary.best_params,
                 )
+                metrics_df = eval_outputs.get("metrics_df")
+                if metrics_df is not None:
+                    metrics_to_bq.write_metrics_detail(
+                        project_id=project_id,
+                        dataset=dataset,
+                        table=metrics_table,
+                        metrics_df=metrics_df,
+                    )
             except Exception as e:
                 logger.warning("metrics_to_bq.write_training_summary failed: %s", e)
 
