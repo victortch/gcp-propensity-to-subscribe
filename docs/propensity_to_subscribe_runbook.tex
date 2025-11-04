@@ -1,4 +1,4 @@
-\documentclass[11pt]{article}
+\documentclass[11pt,twoside]{article}
 \usepackage{amsmath,amsfonts,amssymb}
 \usepackage{geometry}
 \usepackage{hyperref}
@@ -6,118 +6,219 @@
 \usepackage{longtable}
 \usepackage{booktabs}
 \usepackage{graphicx}
+\usepackage{array}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{datetime2}
 \geometry{margin=1in}
 \setlist[itemize]{noitemsep, topsep=2pt}
 \setlist[enumerate]{noitemsep, topsep=2pt}
-\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\env}[1]{\texttt{\$\{#1\}}}
+\newcommand{\gcs}[1]{\code{gs://#1}}
+\newcommand{\bqtable}[1]{\code{#1}}
+\newcommand{\workflow}[1]{\code{#1\_workflow}}
+
 \begin{document}
-\title{Economedia Propensity-to-Subscribe Platform\\Comprehensive Runbook}
-\author{}
-\date{\today}
+
+\title{Economedia Propensity-to-Subscribe Platform\\Cloud Deployment Runbook}
+\author{Economedia Data Science and Engineering}
+\date{\DTMdisplaydate{\the\year}{\the\month}{\the\day}{-1}}
 \maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+This runbook documents the Propensity-to-Subscribe (PTS) engine that Economedia operates on Google Cloud Platform (GCP). It consolidates business context, detailed architecture, operational responsibilities, and the exact sequence of actions (Steps~61--131 from \code{all-steps-to-deploy.txt}) required to complete the production deployment. Each procedure is presented as copy-pasteable commands with opinionated defaults for project \code{economedia-data-prod-laoy} in region \code{europe-west3}. The intent is to provide a single self-sufficient reference that allows a new engineer to recreate the entire environment, understand the moving parts, and validate success without consulting external documentation.
+\end{abstract}
+
+\newpage
 \tableofcontents
 \newpage
 
-\section{Executive Summary}
-The Economedia Propensity-to-Subscribe (PTS) engine delivers calibrated probabilities that a registered reader will subscribe to Capital or Dnevnik within future windows of 30 and 90 days. The platform preserves the analytical rigor of the on-premise Python workflow while introducing cloud-native automation on Google Cloud Platform (GCP). Vertex AI orchestrates quarterly training and daily batch inference jobs, BigQuery is both the system of record for source and model outputs, Cloud Storage retains model artifacts, and Cloud Workflows with Cloud Scheduler provide reliable automation. This document captures the end-to-end architecture and enumerates the remaining infrastructure steps (Steps~61--131 in \texttt{all-steps-to-deploy.txt}) required to bring the deployment to production readiness.
-
-\section{Model Overview}
-\subsection{Business Objective}
-The PTS model estimates the likelihood that a user will accept a paywall offer for Capital or Dnevnik. Four binary targets are modeled simultaneously:
+\section{Executive Overview}
+\subsection{Business Goal}
+Economedia monetises premium journalism for Capital and Dnevnik through subscription paywalls. The PTS model assigns each authenticated reader a calibrated probability of subscribing within 30-day and 90-day horizons for both brands. These probabilities drive:
 \begin{itemize}
-  \item \texttt{cap\_90d} --- Capital subscription within 90 days.
-  \item \texttt{dne\_90d} --- Dnevnik subscription within 90 days.
-  \item \texttt{cap\_30d} --- Capital subscription within 30 days.
-  \item \texttt{dne\_30d} --- Dnevnik subscription within 30 days.
+  \item Paywall decisioning and personalised offers.
+  \item Marketing segmentation for outbound campaigns.
+  \item Editorial personalisation and lifecycle management.
 \end{itemize}
-The calibrated probabilities support marketing prioritization, retention programs, and editorial targeting.
+A binary decision is derived from each probability using thresholds optimised for expected F1 score. The historical Python workflow (\code{original\_files/model\_training\_local4.py}) remains the gold standard; the cloud rewrite preserves its behaviour exactly while adding automation, observability, and governance.
 
-\subsection{Feature Engineering}
-Feature creation adheres to the legacy logic in \texttt{original\_files/data\_engineering7.py} while using parameterised SQL and orchestrated jobs:
-\begin{itemize}
-  \item \textbf{Training and backfill}: \texttt{app/training/sql/build\_training\_dataset.sql} materialises the \texttt{train\_data} and \texttt{cv\_build\_metadata} tables for arbitrary historical windows. Parameters include \texttt{start\_date}, \texttt{freeze\_date}, \texttt{dne\_start}, and \texttt{cap\_wall1\_offer\_start}. Output schemas match the legacy workflow to guarantee comparable metrics.
-  \item \textbf{Daily scoring features}: \texttt{bq/scheduled\_queries/features\_daily.sql} constructs \texttt{propensity\_to\_subscribe.features\_daily}. Each run ingests all sources through the scoring date, applies eligibility filters, and exports the full inference feature vector per user.
-\end{itemize}
-
-\subsection{Modelling Pipeline}
-The trainer in \texttt{app/training/train.py} mirrors \texttt{original\_files/model\_training\_local4.py}:
-\begin{itemize}
-  \item Bayesian optimisation over XGBoost hyperparameters with cross-validation folds generated from \texttt{cv\_build\_metadata}.
-  \item Feature scaling, missing value handling, and class weighting consistent with the historical notebooks.
-  \item Isotonic calibration on hold-out folds per label.
-  \item Global decision thresholds chosen by expected F1 from validation curves.
-  \item Metrics (AUROC, log loss, precision/recall, calibration plots) exported to both Cloud Storage and BigQuery via \texttt{app/training/metrics\_to\_bq.py}.
-\end{itemize}
-Artifacts written to \texttt{gs://economedia-pts-models} include trained boosters, calibration models, metric JSON, run manifests, and Matplotlib figures.
-
-\section{Platform Architecture}
-\subsection{Data Warehouse}
-BigQuery is the authoritative store for all inputs and outputs. Source data resides in \texttt{economedia-data-prod-laoy.*}, while derived assets live in the dedicated \texttt{propensity\_to\_subscribe} dataset:
-\begin{itemize}
-  \item \texttt{train\_data}: snapshot of labelled training rows.
-  \item \texttt{cv\_build\_metadata}: fold assignments and temporal cut-offs.
-  \item \texttt{features\_daily}: inference features partitioned by \texttt{scoring\_date}.
-  \item \texttt{predictions\_daily}: calibrated predictions and binary decisions partitioned by \texttt{scoring\_date}.
-  \item \texttt{train\_metrics}: summary and per-fold evaluation metrics.
-\end{itemize}
-
-\subsection{Training Workflow}
-A Vertex AI Custom Job executes \texttt{app/training/entrypoint.py}. The container:
+\subsection{Key Principles}
+The platform adheres to the following principles:
 \begin{enumerate}
-  \item Executes the training dataset SQL with run-specific parameters.
-  \item Launches cross-validation, hyperparameter search, model fitting, and calibration.
-  \item Uploads artifacts to Cloud Storage and registers a version in Vertex AI Model Registry (repository \texttt{pts\_model} in region \texttt{europe-west3}).
-  \item Writes metrics to BigQuery and updates run metadata tables.
+  \item \textbf{Parity with legacy logic}: Feature engineering, labelling, model hyperparameters, and evaluation mirror the on-premise scripts to guarantee metric parity.
+  \item \textbf{Infrastructure as configuration}: SQL, container builds, Terraform (optional), and Workflows definitions live in version control for repeatability.
+  \item \textbf{Separation of concerns}: Training, inference, orchestration, CI/CD, and monitoring run in distinct components with least-privilege IAM.
+  \item \textbf{Observability}: Every scheduled process emits logs, metrics, and artefacts required for audits and incident response.
 \end{enumerate}
 
-\subsection{Inference Workflow}
-A separate Vertex AI Custom Job executes \texttt{app/inference/entrypoint.py}. At runtime it:
-\begin{enumerate}
-  \item Resolves the latest \texttt{stage=production} model from Model Registry.
-  \item Downloads artifacts from Cloud Storage.
-  \item Reads \texttt{features\_daily} for the requested \texttt{scoring\_date}.
-  \item Produces calibrated probabilities, derives the binary decision column, and writes to \texttt{predictions\_daily}. A JSON run manifest is persisted in Cloud Storage.
-\end{enumerate}
-
-\subsection{Orchestration and Scheduling}
-Two Cloud Workflows definitions \texttt{workflows/training\_workflow.yaml} and \texttt{workflows/inference\_workflow.yaml} orchestrate the Vertex jobs. Cloud Scheduler triggers them (quarterly and daily respectively) with explicit payloads. The daily feature SQL runs as a BigQuery Scheduled Query.
-
-\subsection{CI/CD and Images}
-Cloud Build triggers \texttt{cloudbuild.training.yaml} and \texttt{cloudbuild.inference.yaml} to build container images from \texttt{containers/training.Dockerfile} and \texttt{containers/inference.Dockerfile}. Artifacts publish to Artifact Registry repository \texttt{pts\_model} in \texttt{europe-west3}.
-
-\subsection{Security and IAM}
-Three service accounts enforce least privilege:
+\section{High-Level Architecture}
+\subsection{Data Warehouse Backbone}
+BigQuery is the system of record. Source data resides under datasets \code{economedia-data-prod-laoy.public}, \code{...ecommerce}, and related domains. Derived assets are materialised in dataset \bqtable{economedia-data-prod-laoy.propensity\_to\_subscribe}. Table purposes:
 \begin{itemize}
-  \item \textbf{sa-ml-train}: launches Vertex AI training jobs, queries BigQuery, and manages artifacts in Cloud Storage.
-  \item \textbf{sa-ml-infer}: launches inference jobs, reads features, and writes predictions.
-  \item \textbf{sa-workflows}: executes Workflows and impersonates the training/inference service accounts.
+  \item \bqtable{train\_data}: labelled training rows used by Vertex AI training jobs.
+  \item \bqtable{cv\_build\_metadata}: fold assignments and temporal metadata required to reproduce cross-validation splits.
+  \item \bqtable{features\_daily}: inference feature matrix partitioned by \code{scoring\_date}.
+  \item \bqtable{predictions\_daily}: calibrated probabilities and binary decisions, also partitioned by \code{scoring\_date}.
+  \item \bqtable{train\_metrics}: summary and per-fold evaluation metrics saved after each training run.
 \end{itemize}
-Dataset-level roles and bucket ACLs align with read/write responsibilities, while Cloud Build receives Artifact Registry writer access for image publication.
 
-\subsection{Observability}
-Logs from Vertex jobs stream to Cloud Logging. Cloud Monitoring alert policies cover Vertex job failures, Workflow failures, scheduled query failures, and zero-prediction anomalies. Budgets provide early visibility into cost regressions.
-
-\section{Operational Flow}
-Figure~\ref{fig:pipeline} summarises the data movement (omitted in print). The steady-state cadence is:
+\subsection{Training Pipeline}
+Quarterly model refreshes run as Vertex AI Custom Jobs (container \code{containers/training.Dockerfile}). The entrypoint \code{app/training/entrypoint.py} performs:
 \begin{enumerate}
-  \item Daily: BigQuery scheduled query produces \texttt{features\_daily}.
-  \item Daily: Cloud Scheduler triggers \texttt{inference\_workflow} to score the fresh features.
-  \item Quarterly: Cloud Scheduler triggers \texttt{training\_workflow}, delivering refreshed models and metrics.
-  \item Continuous: Cloud Build rebuilds images upon \texttt{main} updates.
-  \item As needed: Analysts interrogate BigQuery tables and Cloud Storage artifacts.
+  \item Parameterised execution of \code{app/training/sql/build\_training\_dataset.sql} to refresh \bqtable{train\_data} and \bqtable{cv\_build\_metadata}.
+  \item Cross-validation with Bayesian optimisation of XGBoost hyperparameters, reusing the exact search space and scoring logic from the legacy script.
+  \item Label-wise isotonic calibration and F1-based threshold selection.
+  \item Persistence of artefacts to \gcs{economedia-pts-models} and metrics to \bqtable{train\_metrics} through \code{app/training/metrics\_to\_bq.py}.
+  \item Registration of a Vertex AI Model Registry version tagged with metadata (run ID, SQL digest, data window, stage label).
 \end{enumerate}
 
-\section{Deployment Steps (61--131)}
-This section provides copy-pasteable commands for the outstanding deployment work. Set the following environment variables once per shell session:
+\subsection{Inference Pipeline}
+Daily scoring runs as a separate Vertex AI Custom Job (container \code{containers/inference.Dockerfile}) invoking \code{app/inference/entrypoint.py}:
+\begin{enumerate}
+  \item Resolve the latest \code{stage=production} model version in Model Registry.
+  \item Download calibrated boosters, scalers, thresholds, and metadata from \gcs{economedia-pts-models}.
+  \item Load \bqtable{features\_daily} for the provided \code{scoring\_date}.
+  \item Generate probabilities and the binary decision for each label; write results to \bqtable{predictions\_daily} and persist a JSON manifest to \gcs{economedia-pts-models/inference/}.
+\end{enumerate}
+
+\subsection{Orchestration}
+Two Cloud Workflows definitions coordinate long-running jobs:
+\begin{itemize}
+  \item \workflow{training}: invoked quarterly by Cloud Scheduler; submits the Vertex training job and monitors completion.
+  \item \workflow{inference}: invoked daily; triggers the inference job with \code{scoring\_date = YESTERDAY}.
+\end{itemize}
+A BigQuery Scheduled Query populates \bqtable{features\_daily} before inference runs.
+
+\subsection{CI/CD}
+Cloud Build triggers defined in \code{cloudbuild/cloudbuild.training.yaml} and \code{cloudbuild/cloudbuild.inference.yaml} build and publish Docker images to Artifact Registry \code{europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts\_model} whenever \code{main} changes.
+
+\subsection{Security Model}
+Dedicated service accounts enforce least privilege:
+\begin{description}
+  \item[\code{sa-ml-train}] Vertex AI training jobs, BigQuery read/write (training tables), GCS objectAdmin on \gcs{economedia-pts-models}.
+  \item[\code{sa-ml-infer}] Vertex AI inference jobs, BigQuery read (\bqtable{features\_daily}) + write (\bqtable{predictions\_daily}), GCS objectViewer.
+  \item[\code{sa-workflows}] Executes Workflows and impersonates the other two service accounts.
+\end{description}
+Cloud Build's default service account receives Artifact Registry writer permissions.
+
+\subsection{Observability and Cost}
+Logs from containers stream to Cloud Logging; Cloud Monitoring policies alert on Vertex job failures, Workflow failures, scheduled query errors, and zero predictions. Budgets provide guardrails on spend. Artefacts (models, plots, manifests) remain in Cloud Storage for audit.
+
+\section{Detailed Component Reference}
+\subsection{Source of Truth Scripts}
+\begin{longtable}{p{0.27\linewidth} p{0.68\linewidth}}
+\toprule
+\textbf{Path} & \textbf{Purpose}\\
+\midrule
+\code{original\_files/data\_engineering7.py} & Legacy feature engineering and dataset assembly logic. All SQL in \code{app/training/sql} and \code{bq/scheduled\_queries} derives from this script.\\
+\code{original\_files/model\_training\_local4.py} & Legacy trainer with Bayesian optimisation, calibration, plots, and metrics. Cloud trainer preserves behaviour.\\
+\code{app/training/train.py} & Entry module orchestrating data prep, training, evaluation, artefact export, and Model Registry updates.\\
+\code{app/training/metrics\_to\_bq.py} & Helper utilities to persist per-fold and aggregate metrics to BigQuery tables.\\
+\code{app/inference/batch\_predict.py} & Score new feature rows using the latest production artefacts.\\
+\code{bq/scheduled\_queries/features\_daily.sql} & Scheduled query assembling inference features per user per day.\\
+\bottomrule
+\end{longtable}
+
+\subsection{Data Contracts}
+Table~\ref{tab:tables} lists critical schema expectations that downstream processes rely on.
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{p{0.28\linewidth} p{0.62\linewidth}}
+    \toprule
+    \textbf{Table} & \textbf{Key Columns and Notes}\\
+    \midrule
+    \bqtable{propensity\_to\_subscribe.train\_data} & All model features plus labels \code{cap\_90d}, \code{dne\_90d}, \code{cap\_30d}, \code{dne\_30d}. Partitioned by \code{snapshot\_date}.\\
+    \bqtable{propensity\_to\_subscribe.cv\_build\_metadata} & Columns \code{user\_id}, \code{fold\_id}, \code{train\_start}, \code{train\_end}, \code{validation\_start}, \code{validation\_end}.\\
+    \bqtable{propensity\_to\_subscribe.features\_daily} & Feature columns only, partitioned by \code{scoring\_date}; enforced eligibility for Capital and Dnevnik readers.\\
+    \bqtable{propensity\_to\_subscribe.predictions\_daily} & Partition column \code{scoring\_date}, plus \code{prob\_cap\_90d}, \code{decision\_cap\_90d}, etc., along with run metadata.\\
+    \bqtable{propensity\_to\_subscribe.train\_metrics} & Summary metrics per run (ROC AUC, log loss, lift, threshold, calibration Brier score) and per-fold rows.\\
+    \bottomrule
+  \end{tabular}
+  \caption{BigQuery table contracts for the PTS platform.}
+  \label{tab:tables}
+\end{table}
+
+\subsection{Artefact Storage Layout}
+Artefacts in \gcs{economedia-pts-models} follow the layout in Table~\ref{tab:gcs}.
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{p{0.32\linewidth} p{0.58\linewidth}}
+    \toprule
+    \textbf{Prefix} & \textbf{Contents}\\
+    \midrule
+    \code{training/\{run\_id\}/models/} & XGBoost boosters per label (binary files).\\
+    \code{training/\{run\_id\}/calibration/} & Isotonic calibration pickles and threshold JSON.\\
+    \code{training/\{run\_id\}/plots/} & ROC, PR, calibration, and lift plots (PNG).\\
+    \code{training/\{run\_id\}/metrics/} & Metrics summary JSON, per-fold CSV.\\
+    \code{inference/\{scoring\_date\}/manifest.json} & Metadata captured after each scoring job (model version, row counts, checksum).\\
+    \bottomrule
+  \end{tabular}
+  \caption{Cloud Storage artefact structure.}
+  \label{tab:gcs}
+\end{table}
+
+\section{Operational Timeline}
+\subsection{Daily Cadence}
+\begin{enumerate}
+  \item 00:30 EET --- BigQuery scheduled query builds \bqtable{features\_daily} for \code{scoring\_date = yesterday}.\footnote{Schedule adjustable via BigQuery Data Transfer Service.}
+  \item 04:00 EET --- Cloud Scheduler invokes \workflow{inference}; Vertex AI inference job scores features and writes \bqtable{predictions\_daily}.
+  \item 05:00 EET --- Downstream systems (marketing automation, dashboards) consume fresh predictions.
+\end{enumerate}
+
+\subsection{Quarterly Cadence}
+\begin{enumerate}
+  \item Day 1 of January/April/July/October at 06:00 EET --- Cloud Scheduler triggers \workflow{training}.
+  \item Vertex training job rebuilds training tables, retrains, uploads artefacts, updates Model Registry, and writes metrics.
+  \item Post-run review: data science signs off metrics in \bqtable{train\_metrics}, promotes model by setting label \code{stage=production}, and records change in \code{promotion\_record.txt}.
+\end{enumerate}
+
+\section{Architecture Diagram}
+
+\begin{figure}[H]
+  \centering
+  \fbox{\begin{minipage}{0.9\linewidth}
+    \centering
+    \textbf{Data Flow Overview}\\[4pt]
+    Source datasets (BigQuery) $\rightarrow$ Training SQL build $\rightarrow$ Vertex AI Training Job\\
+    $\rightarrow$ Model Artefacts in GCS $\rightarrow$ Vertex AI Model Registry\\[6pt]
+    Daily features scheduled query $\rightarrow$ Vertex AI Inference Job $\rightarrow$ Predictions table $\rightarrow$ Downstream apps\\[6pt]
+    Cloud Scheduler + Cloud Workflows orchestrate both training and inference; Cloud Build maintains container images.
+  \end{minipage}}
+  \caption{PTS pipeline interaction across GCP services.}
+  \label{fig:pipeline}
+\end{figure}
+
+\section{Environment Configuration}
+\subsection{Required Environment Variables}
+Before running any CLI commands in later sections, export the environment variables in Listing~\ref{lst:env}.
+
+\begin{figure}[H]
 \begin{verbatim}
 export PROJECT_ID=economedia-data-prod-laoy
 export REGION=europe-west3
 export ARTIFACT_REPO=pts_model
 export BUCKET=gs://economedia-pts-models
+export DATASET=propensity_to_subscribe
+export LOCATION=europe-west3
 \end{verbatim}
-Unless noted, run commands from a workstation authenticated with the target project.
+\caption{Shell exports used throughout this runbook.}
+\label{lst:env}
+\end{figure}
 
-\subsection{Phase 1 — Enable Required APIs (61--72)}
+\subsection{Service Account Naming}
+Service accounts follow the convention \code{sa-<purpose>@\env{PROJECT\_ID}.iam.gserviceaccount.com}. Keep display names descriptive to simplify IAM audits.
+
+\section{Deployment Procedures (Steps 61--131)}
+This section reproduces Steps~61--131 from \code{all-steps-to-deploy.txt} with enriched context and verification hints. Commands are grouped by logical phase.
+
+\subsection{Phase 61--72: Enable APIs}
 \begin{verbatim}
 gcloud services enable \
   aiplatform.googleapis.com \
@@ -131,10 +232,12 @@ gcloud services enable \
   cloudscheduler.googleapis.com \
   logging.googleapis.com \
   monitoring.googleapis.com \
-  compute.googleapis.com --project=${PROJECT_ID}
+  compute.googleapis.com \
+  --project=${PROJECT_ID}
 \end{verbatim}
+Use \code{gcloud services list --enabled --project=\env{PROJECT\_ID}} afterwards to confirm activations.
 
-\subsection{Phase 2 — Service Accounts (73--75)}
+\subsection{Phase 73--75: Create Service Accounts}
 \begin{verbatim}
 gcloud iam service-accounts create sa-ml-train \
   --project=${PROJECT_ID} \
@@ -148,9 +251,10 @@ gcloud iam service-accounts create sa-workflows \
   --project=${PROJECT_ID} \
   --display-name="PTS Workflows Orchestrator"
 \end{verbatim}
+Document the resulting emails for future IAM operations.
 
-\subsection{Phase 3 — IAM Bindings (76--86)}
-\paragraph{Project-level roles}
+\subsection{Phase 76--86: Grant Roles}
+\paragraph{Project-level Permissions}
 \begin{verbatim}
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
   --member="serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -184,7 +288,8 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
   --member="serviceAccount:sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com" \
   --role="roles/bigquery.jobUser"
 \end{verbatim}
-\paragraph{Service account impersonation}
+
+\paragraph{Service Account Impersonation}
 \begin{verbatim}
 gcloud iam service-accounts add-iam-policy-binding \
   sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com \
@@ -196,17 +301,18 @@ gcloud iam service-accounts add-iam-policy-binding \
   --member="serviceAccount:sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com" \
   --role="roles/iam.serviceAccountUser"
 \end{verbatim}
-\paragraph{Cloud Build permissions}
+
+\paragraph{Cloud Build Writer}
 \begin{verbatim}
-CLOUDBUILD_SA=$(gcloud projects describe ${PROJECT_ID} \
-  --format="value(projectNumber)")@cloudbuild.gserviceaccount.com
+PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format="value(projectNumber)")
+CLOUDBUILD_SA=${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com
 
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
   --member="serviceAccount:${CLOUDBUILD_SA}" \
   --role="roles/artifactregistry.writer"
 \end{verbatim}
 
-\subsection{Phase 4 — Storage, Dataset, and Tables (87--93)}
+\subsection{Phase 87--93: Create Storage and Tables}
 \begin{verbatim}
 gcloud artifacts repositories create ${ARTIFACT_REPO} \
   --project=${PROJECT_ID} \
@@ -218,54 +324,54 @@ gsutil mb -p ${PROJECT_ID} -l ${REGION} ${BUCKET}
 
 gsutil requester-pays set off ${BUCKET}
 
-bq --location=${REGION} --project_id=${PROJECT_ID} mk --dataset propensity_to_subscribe
+bq --location=${LOCATION} --project_id=${PROJECT_ID} mk --dataset ${DATASET}
 
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
   < bq/ddl/create_predictions_daily.sql
 
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
   < bq/ddl/create_train_metrics.sql
 
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
   < bq/ddl/create_feature_views.sql
 \end{verbatim}
+If the dataset already exists, the \code{mk} command returns an error; this is safe to ignore.
 
-\subsection{Phase 5 — Dataset-level IAM (94--100)}
+\subsection{Phase 94--100: Dataset and Bucket IAM}
 \begin{verbatim}
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
-  "GRANT SELECT ON DATASET `economedia-data-prod-laoy.public`
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
+  "GRANT SELECT ON DATASET `economedia-data-prod-laoy.public` \\
      TO \"serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com\""
 
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
-  "GRANT SELECT ON DATASET `economedia-data-prod-laoy.ecommerce`
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
+  "GRANT SELECT ON DATASET `economedia-data-prod-laoy.ecommerce` \\
      TO \"serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com\""
 
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
-  "GRANT SELECT ON DATASET `${PROJECT_ID}.propensity_to_subscribe`
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
+  "GRANT SELECT ON DATASET `${PROJECT_ID}.${DATASET}` \\
      TO \"serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com\""
 
-bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${REGION} \
-  "GRANT SELECT, INSERT, UPDATE, DELETE ON DATASET `${PROJECT_ID}.propensity_to_subscribe`
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
+  "GRANT SELECT, INSERT, UPDATE, DELETE ON DATASET `${PROJECT_ID}.${DATASET}` \\
      TO \"serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com\""
 
 gsutil iam ch serviceAccount:sa-ml-train@${PROJECT_ID}.iam.gserviceaccount.com:objectAdmin ${BUCKET}
 
 gsutil iam ch serviceAccount:sa-ml-infer@${PROJECT_ID}.iam.gserviceaccount.com:objectViewer ${BUCKET}
 \end{verbatim}
-(Use \texttt{bq show --format=prettyjson} to verify existing bindings before and after the GRANT statements.)
+Validate with \code{bq show --format=prettyjson --dataset \env{PROJECT\_ID}:\env{DATASET}}.
 
-\subsection{Phase 6 — Local Configuration (101--102)}
-Copy the environment template and commit:
+\subsection{Phase 101--102: Local Configuration}
 \begin{verbatim}
 cp configs/env.example.yaml configs/env.yaml
-# Edit credentials, dataset overrides, and registry settings as needed.
+# Edit configs/env.yaml to match deployment project, bucket, and dataset.
 
 git add configs/env.yaml
-
 git commit -m "Add project-specific environment configuration"
 \end{verbatim}
+This step ensures engineers share a consistent local configuration file (excluded from gitignore only when intentionally committed).
 
-\subsection{Phase 7 — Build and Publish Images (103--104)}
+\subsection{Phase 103--104: Build and Publish Images}
 \begin{verbatim}
 gcloud builds submit --project=${PROJECT_ID} \
   --config=cloudbuild/cloudbuild.training.yaml .
@@ -273,9 +379,14 @@ gcloud builds submit --project=${PROJECT_ID} \
 gcloud builds submit --project=${PROJECT_ID} \
   --config=cloudbuild/cloudbuild.inference.yaml .
 \end{verbatim}
-Confirm the resulting images exist in \texttt{${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/training:latest} and \texttt{.../inference:latest}.
+Confirm artefacts with:
+\begin{verbatim}
+gcloud artifacts docker images list \
+  ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}
+\end{verbatim}
+Images \code{training:latest} and \code{inference:latest} should appear with recent timestamps.
 
-\subsection{Phase 8 — Deploy Workflows (105--108)}
+\subsection{Phase 105--108: Deploy Workflows}
 \begin{verbatim}
 gcloud workflows deploy training_workflow \
   --project=${PROJECT_ID} \
@@ -289,8 +400,9 @@ gcloud workflows deploy inference_workflow \
   --source=workflows/inference_workflow.yaml \
   --service-account=sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com
 \end{verbatim}
+Check deployment status via \code{gcloud workflows describe <name> --location=\env{REGION}}.
 
-\subsection{Phase 9 — Cloud Scheduler Jobs (109--110)}
+\subsection{Phase 109--110: Configure Cloud Scheduler}
 \begin{verbatim}
 gcloud scheduler jobs create http training-quarterly \
   --project=${PROJECT_ID} \
@@ -310,19 +422,18 @@ gcloud scheduler jobs create http inference-daily \
   --oauth-service-account-email=sa-workflows@${PROJECT_ID}.iam.gserviceaccount.com \
   --message-body='{"scoring_date": "${YESTERDAY}"}'
 \end{verbatim}
-Set \texttt{YESTERDAY} via a scheduler parameter or update the Workflow to compute it automatically.
+Set \code{YESTERDAY} as an environment variable in the job or modify the workflow to derive it automatically.
 
-\subsection{Phase 10 — BigQuery Scheduled Query (111--114)}
+\subsection{Phase 111--114: BigQuery Scheduled Query}
 \begin{verbatim}
 QUERY_BODY=$(tr '\n' ' ' < bq/scheduled_queries/features_daily.sql)
 
-# Requires jq for parsing JSON responses
 TRANSFER_CONFIG=$(bq mk --transfer_config \
   --project_id=${PROJECT_ID} \
   --data_source=scheduled_query \
-  --target_dataset=propensity_to_subscribe \
+  --target_dataset=${DATASET} \
   --display_name="PTS Daily Features" \
-  --location=${REGION} \
+  --location=${LOCATION} \
   --params="{\"query\": \"${QUERY_BODY}\", \"destination_table_name_template\": \"features_daily\", \"partitioning_field\": \"scoring_date\", \"write_disposition\": \"WRITE_TRUNCATE\"}" \
   --format=json | jq -r '.name')
 
@@ -330,32 +441,33 @@ bq update --transfer_config --params '{"time_zone": "Europe/Sofia"}' ${TRANSFER_
 
 bq update --transfer_config --params '{"schedule": "every 24 hours"}' ${TRANSFER_CONFIG}
 \end{verbatim}
-Ensure the scheduled query service account has dataset write permissions (BigQuery UI shows the SA email upon creation).
+Ensure the transfer service account appears with write access on the dataset.
 
-\subsection{Phase 11 — First Training Run (115--118)}
+\subsection{Phase 115--118: Bootstrap Training Run}
 \begin{verbatim}
 gcloud workflows executions run training_workflow \
   --project=${PROJECT_ID} \
   --location=${REGION} \
   --data='{"run_id": "bootstrap-$(date +%Y%m%d)"}'
 \end{verbatim}
-Monitor the execution in Cloud Console. After success:
+Post-run checks:
 \begin{itemize}
-  \item Confirm artifacts under \texttt{${BUCKET}/training/}.
-  \item Inspect BigQuery \texttt{train\_metrics} for the new \texttt{run\_id}.
-  \item In Vertex Model Registry, verify a model version exists with metadata (run ID, SQL SHA, data window).
-  \item Apply the label \texttt{stage=candidate} using either the console or:
+  \item Inspect \gcs{economedia-pts-models/training/} for a directory named after the run ID.
+  \item Query \bqtable{propensity\_to\_subscribe.train\_metrics} for matching \code{run\_id} rows.
+  \item Verify a new model version appears in Vertex AI Model Registry with labels \code{stage=candidate}.
 \end{itemize}
+Apply the candidate label via:
 \begin{verbatim}
-gcloud ai models update VERSION_ID \
+gcloud ai model-versions update <VERSION_ID> \
   --project=${PROJECT_ID} \
   --region=${REGION} \
   --update-labels=stage=candidate
 \end{verbatim}
 
-\subsection{Phase 12 — Promotion (119--120)}
+\subsection{Phase 119--120: Promote to Production}
 \begin{verbatim}
-MODEL_ID=$(gcloud ai models list --project=${PROJECT_ID} --region=${REGION} \
+MODEL_ID=$(gcloud ai models list \
+  --project=${PROJECT_ID} --region=${REGION} \
   --filter="displayName=pts-model" --format="value(name)")
 
 VERSION_ID=$(gcloud ai model-versions list ${MODEL_ID} \
@@ -369,9 +481,9 @@ gcloud ai model-versions update ${VERSION_ID} \
 
 echo "Promoted version: ${VERSION_ID}" > promotion_record.txt
 \end{verbatim}
-Store \texttt{promotion\_record.txt} in version control for auditability.
+Commit \code{promotion\_record.txt} or store it in an auditable location.
 
-\subsection{Phase 13 — First Inference Run (121--122)}
+\subsection{Phase 121--122: First Inference Run}
 \begin{verbatim}
 SCORING_DATE=$(date -u -d "yesterday" +%Y-%m-%d)
 
@@ -379,17 +491,15 @@ gcloud workflows executions run inference_workflow \
   --project=${PROJECT_ID} \
   --location=${REGION} \
   --data="{\"scoring_date\": \"${SCORING_DATE}\"}"
-\end{verbatim}
-Validate BigQuery rows:
-\begin{verbatim}
+
 bq query --use_legacy_sql=false --project_id=${PROJECT_ID} \
-  "SELECT COUNT(*) AS predictions
-     FROM `${PROJECT_ID}.propensity_to_subscribe.predictions_daily`
+  "SELECT COUNT(*) AS predictions \\
+     FROM `${PROJECT_ID}.${DATASET}.predictions_daily` \\
     WHERE scoring_date = '${SCORING_DATE}'"
 \end{verbatim}
+Confirm the row count aligns with the number of eligible users for that date.
 
-\subsection{Phase 14 — Monitoring and Budgets (123--127)}
-Budgets and alert policies can be scripted via \texttt{gcloud alpha billing budgets} and \texttt{gcloud monitoring policies}. Minimal examples:
+\subsection{Phase 123--127: Monitoring and Budgeting}
 \begin{verbatim}
 gcloud alpha billing budgets create \
   --billing-account=XXXX-XXXX-XXXX-XXXX \
@@ -404,40 +514,145 @@ gcloud monitoring policies create --policy-from-file=configs/alerts/bq_scheduled
 
 gcloud monitoring policies create --policy-from-file=configs/alerts/zero_predictions.json
 \end{verbatim}
-Adjust notification channels and thresholds as required.
+Replace the billing account ID and adjust thresholds according to finance guidelines.
 
-\subsection{Phase 15 — Housekeeping (128--131)}
+\subsection{Phase 128--131: Retention and Documentation}
 \begin{verbatim}
-bq update --table ${PROJECT_ID}:propensity_to_subscribe.predictions_daily \
-  --set_expiration 7776000   # 90 days in seconds
+bq update --table ${PROJECT_ID}:${DATASET}.predictions_daily --set_expiration 7776000
 
-bq update --table ${PROJECT_ID}:propensity_to_subscribe.features_daily \
-  --set_expiration 7776000
+bq update --table ${PROJECT_ID}:${DATASET}.features_daily --set_expiration 7776000
 
 git tag v1.0.0
-
 git push origin main --tags
 
-# Update README with the runbook link (pointing to the generated PDF).
-# Example snippet:
-#   Runbook: docs/propensity_to_subscribe_runbook.pdf
+# Update README to link the generated PDF runbook.
+sed -i '' 's#Runbook:.*#Runbook: docs/propensity_to_subscribe_runbook.pdf#' README.md || \
+  perl -0pi -e 's#Runbook:.*#Runbook: docs/propensity_to_subscribe_runbook.pdf#' README.md
 
 git add README.md
 
 git commit -m "Document runbook link"
 \end{verbatim}
+The \code{sed} command uses macOS syntax; the Perl fallback covers Linux environments.
 
-\section{Verification Checklist}
-After completing Steps~61--131, perform the following validation:
+\section{Testing and Validation}
+\subsection{Pre-deployment}
+\begin{itemize}
+  \item \textbf{Static analysis}: \code{python -m compileall app} to verify import paths and syntax.
+  \item \textbf{Unit smoke tests}: Run \code{pytest} (if available) or targeted module tests before container builds.
+  \item \textbf{Container build}: Use \code{docker build} locally when iterating quickly.
+\end{itemize}
+
+\subsection{Post-training}
+\begin{itemize}
+  \item Compare \code{train\_metrics} tables across the latest run and historical baseline; investigate deviations beyond tolerance.
+  \item Validate calibration plots stored in \gcs{economedia-pts-models/training/<run\_id>/plots/} for monotonicity.
+  \item Confirm Model Registry metadata (labels, description, artifact URIs) reflects the latest run.
+\end{itemize}
+
+\subsection{Post-inference}
+\begin{itemize}
+  \item Spot-check prediction distributions across consecutive days for drift.
+  \item Ensure \code{decision\_*} columns maintain expected positive rates compared to historical averages.
+  \item Validate \code{inference/\{scoring\_date\}/manifest.json} for accurate row counts and model version references.
+\end{itemize}
+
+\section{Operational Playbooks}
+\subsection{Rerunning Training Manually}
 \begin{enumerate}
-  \item \textbf{Static checks}: \texttt{python -m compileall app} to ensure there are no syntax errors before deploying new images.
-  \item \textbf{Scheduled query dry run}: Execute \texttt{bq query --dry\_run=true} on \texttt{bq/scheduled\_queries/features\_daily.sql} to confirm costs and correctness.
-  \item \textbf{Training smoke test}: Review Vertex AI job logs for warnings; confirm evaluation metrics align with historical baselines in BigQuery.
-  \item \textbf{Inference sanity}: Compare probability distributions across consecutive days; investigate if zero predictions are produced.
-  \item \textbf{Monitoring}: Trigger test alerts (e.g., disable a Workflow briefly) to verify notification channels.
+  \item Trigger \workflow{training} with a unique \code{run\_id}:\newline
+  \code{gcloud workflows executions run training\_workflow --data='{"run_id": "manual-YYYYMMDD"}'}.
+  \item Monitor execution via Cloud Console or \code{gcloud workflows executions describe}.
+  \item After success, review metrics and promote if acceptable.
 \end{enumerate}
 
+\subsection{Backfilling Predictions}
+\begin{enumerate}
+  \item Ensure \bqtable{features\_daily} contains the desired backfill date (rerun scheduled query with \code{scoring\_date} override if needed).
+  \item Execute \workflow{inference} with \code{scoring\_date} set to the historical day.
+  \item Archive resulting manifest and confirm \bqtable{predictions\_daily} partition updated.
+\end{enumerate}
+
+\subsection{Disaster Recovery}
+\begin{itemize}
+  \item \textbf{Artefact loss}: Re-run the latest training job using the same parameters; GCS versioning can be enabled for additional safety.
+  \item \textbf{Model regression}: Use Model Registry to roll back by promoting the previous version to \code{stage=production}.
+  \item \textbf{Failed inference}: Investigate Cloud Logging; rerun \workflow{inference} once root cause is resolved.
+\end{itemize}
+
+\section{Monitoring Catalogue}
+Table~\ref{tab:alerts} lists recommended alerts.
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{p{0.32\linewidth} p{0.58\linewidth}}
+    \toprule
+    \textbf{Alert} & \textbf{Trigger Condition}\\
+    \midrule
+    Vertex training failure & Any Vertex Custom Job with label \code{component=training} fails.\\
+    Vertex inference failure & Any Vertex Custom Job with label \code{component=inference} fails or exceeds runtime SLA.\\
+    Workflow failure & \workflow{training} or \workflow{inference} execution ends in \code{FAILED}.\\
+    Scheduled query failure & BigQuery transfer job \code{PTS Daily Features} misses a run or errors.\\
+    Zero predictions & Daily partition row count $= 0$ for \bqtable{predictions\_daily}.\\
+    Budget threshold & Spend exceeds 80\% of configured monthly amount.\\
+    \bottomrule
+  \end{tabular}
+  \caption{Monitoring and alert policies.}
+  \label{tab:alerts}
+\end{table}
+
+\section{Appendix A: Glossary}
+\begin{itemize}
+  \item \textbf{PTS}: Propensity-to-Subscribe.
+  \item \textbf{CV}: Cross-validation.
+  \item \textbf{Run ID}: Unique identifier for each training execution, often \code{YYYYMMDD-hhmmss}.
+  \item \textbf{Stage label}: Model Registry label indicating lifecycle state (candidate vs.\ production).
+\end{itemize}
+
+\section{Appendix B: Troubleshooting Cheatsheet}
+\subsection{Common Errors}
+\begin{description}
+  \item[BigQuery permissions error] Ensure dataset grants include the executing service account; re-run Section~\ref{lst:env} IAM steps.
+  \item[Vertex job stuck] Check Cloud Logging for network or quota errors; ensure Artifact Registry images exist and service account has \code{roles/artifactregistry.reader}.
+  \item[Scheduled query missing partition] Manually rerun using \code{bq query --use\_legacy\_sql=false --parameter=... < features\_daily.sql}. Confirm upstream source tables contain data for the requested date.
+  \item[Model Registry duplicate versions] Use descriptive \code{run\_id}; delete stale versions via \code{gcloud ai model-versions delete} only if confirmed unused.
+\end{description}
+
+\subsection{Support Escalation}
+\begin{enumerate}
+  \item On-call data engineer triages logs and metrics.
+  \item Notify product stakeholders if inference output is delayed beyond 2 hours.
+  \item File an incident report summarising impact, root cause, and mitigation.
+\end{enumerate}
+
+\section{Appendix C: Artefact Checklist}
+Prior to go-live ensure the following artefacts exist:
+\begin{itemize}
+  \item \gcs{economedia-pts-models/training/<run\_id>/models/} contains boosters for all four labels.
+  \item \gcs{economedia-pts-models/training/<run\_id>/plots/} contains ROC, PR, calibration, and lift curves.
+  \item \bqtable{train\_metrics} includes both summary and detail tables populated for the last run.
+  \item Vertex AI Model Registry lists at least one \code{stage=production} model version.
+  \item Cloud Scheduler jobs \code{training-quarterly} and \code{inference-daily} show last run status \code{SUCCEEDED}.
+  \item BigQuery transfer \code{PTS Daily Features} shows a successful run within the last 24 hours.
+\end{itemize}
+
+\section{Appendix D: Change Management Template}
+When promoting a new model version, capture the following in \code{promotion\_record.txt}:
+\begin{itemize}
+  \item Date of promotion.
+  \item Vertex model version resource name.
+  \item Run ID and training data window.
+  \item Summary metrics (AUC, log loss, calibration slope).
+  \item Approver name.
+\end{itemize}
+Store the file in the repository or an internal knowledge base for audit readiness.
+
 \section{Document Maintenance}
-Compile this \LaTeX{} source with \texttt{pdflatex docs/propensity\_to\_subscribe\_runbook.tex}. Store the generated PDF alongside the source and update the README link whenever the runbook is refreshed.
+Compile this document using \code{pdflatex docs/propensity\_to\_subscribe\_runbook.tex}. After each substantial change:
+\begin{enumerate}
+  \item Re-export the PDF and store it alongside the source.
+  \item Update \code{README.md} to reference the latest PDF revision.
+  \item Notify stakeholders of material process updates.
+\end{enumerate}
 
 \end{document}
