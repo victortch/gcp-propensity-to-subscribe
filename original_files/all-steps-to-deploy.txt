@@ -1,0 +1,209 @@
+
+### Phase 0 — Repository scaffolding (code only)
+
+1. Create Git repository `economedia-pts`
+2. Add `README.md`
+3. Add `.gitignore`
+4. Add `configs/env.example.yaml`
+5. Add `configs/labels.yaml`
+6. Add `configs/thresholds_policy.yaml`
+7. Create folder `app/common`
+8. Add `app/common/__init__.py`
+9. Add `app/common/io.py`
+10. Add `app/common/bq_utils.py`
+11. Add `app/common/preprocessing.py`
+12. Add `app/common/registry.py`
+13. Add `app/common/utils.py`
+14. Create folder `app/training`
+15. Add `app/training/__init__.py`
+16. Add `app/training/entrypoint.py`
+17. Add `app/training/cv_build.py`
+18. Add `app/training/train.py`
+19. Add `app/training/artifact_io.py`
+20. Add `app/training/metrics_to_bq.py`
+21. Create folder `app/training/sql`
+22. Add `app/training/sql/build_training_dataset.sql`
+23. Create folder `app/inference`
+24. Add `app/inference/__init__.py`
+25. Add `app/inference/entrypoint.py`
+26. Add `app/inference/batch_predict.py`
+27. Add `app/inference/schema.py`
+28. Create folder `bq/ddl`
+29. Add `bq/ddl/create_predictions_daily.sql`
+30. Add `bq/ddl/create_train_metrics.sql`
+31. Add `bq/ddl/create_feature_views.sql`
+32. Create folder `bq/scheduled_queries`
+33. Add `bq/scheduled_queries/features_daily.sql`
+34. Create folder `containers`
+35. Add `containers/training.Dockerfile`
+36. Add `containers/inference.Dockerfile`
+37. Add `containers/requirements-training.txt`
+38. Add `containers/requirements-inference.txt`
+39. Create folder `workflows`
+40. Add `workflows/inference_workflow.yaml`
+41. Add `workflows/training_workflow.yaml`
+42. Create folder `cloudbuild`
+43. Add `cloudbuild/cloudbuild.training.yaml`
+44. Add `cloudbuild/cloudbuild.inference.yaml`
+45. Add `cloudbuild/cloudbuild.all.yaml`
+46. Create folder `scripts`
+47. Add `scripts/gcloud_bootstrap.sh`
+48. Add `scripts/deploy_workflows.sh`
+49. Add `scripts/schedule_jobs.sh`
+50. Add `scripts/create_scheduled_query.sh`
+51. Create folder `infra/terraform` (optional)
+52. Add `infra/terraform/main.tf` (optional)
+53. Add `infra/terraform/variables.tf` (optional)
+54. Add `infra/terraform/iam.tf` (optional)
+55. Add `infra/terraform/artifact_registry.tf` (optional)
+56. Add `infra/terraform/storage.tf` (optional)
+57. Add `infra/terraform/bigquery.tf` (optional)
+58. Add `infra/terraform/workflows.tf` (optional)
+59. Add `infra/terraform/scheduler.tf` (optional)
+60. Commit repository initial content
+
+---
+
+### Phase 1 — Project APIs
+
+61. Enable Vertex AI API
+62. Enable BigQuery API
+63. Enable BigQuery Storage API
+64. Enable BigQuery Data Transfer API
+65. Enable Artifact Registry API
+66. Enable Cloud Build API
+67. Enable Cloud Storage API
+68. Enable Workflows API
+69. Enable Cloud Scheduler API
+70. Enable Cloud Logging API
+71. Enable Cloud Monitoring API
+72. Enable Compute Engine API
+
+---
+
+### Phase 2 — Service accounts
+
+73. Create service account `sa-ml-train`
+74. Create service account `sa-ml-infer`
+75. Create service account `sa-workflows`
+
+---
+
+### Phase 3 — IAM bindings (minimal, one binding per step)
+
+76. Grant `roles/aiplatform.user` to `sa-ml-train`
+77. Grant `roles/bigquery.jobUser` to `sa-ml-train`
+78. Grant `roles/artifactregistry.reader` to `sa-ml-train`
+79. Grant `roles/aiplatform.user` to `sa-ml-infer`
+80. Grant `roles/bigquery.jobUser` to `sa-ml-infer`
+81. Grant `roles/artifactregistry.reader` to `sa-ml-infer`
+82. Grant `roles/aiplatform.user` to `sa-workflows`
+83. Grant `roles/bigquery.jobUser` to `sa-workflows`
+84. Grant `roles/iam.serviceAccountUser` on `sa-ml-train` to `sa-workflows`
+85. Grant `roles/iam.serviceAccountUser` on `sa-ml-infer` to `sa-workflows`
+86. Grant `roles/artifactregistry.writer` to Cloud Build default service account
+
+---
+
+### Phase 4 — Storage, datasets, and tables
+
+87. Create Artifact Registry Docker repository `ml`
+88. Create GCS bucket `gs://economedia-pts-models`
+89. Set bucket location on `gs://economedia-pts-models`
+90. Create BigQuery dataset `propensity_to_subscribe`
+91. Create table `propensity_to_subscribe.predictions_daily`
+92. Create table `propensity_to_subscribe.train_metrics`
+93. Create table `propensity_to_subscribe.features_daily`
+
+---
+
+### Phase 5 — Dataset-level IAM (one grant per step)
+
+94. Grant `roles/bigquery.dataViewer` on `economedia-data-prod-laoy.public` to `sa-ml-train`
+95. Grant `roles/bigquery.dataViewer` on `economedia-data-prod-laoy.ecommerce` to `sa-ml-train`
+96. Grant `roles/bigquery.dataViewer` on `propensity_to_subscribe` to `sa-ml-train`
+97. Grant `roles/bigquery.dataViewer` on `propensity_to_subscribe` to `sa-ml-infer`
+98. Grant `roles/bigquery.dataEditor` on `propensity_to_subscribe` to `sa-ml-infer`
+99. Grant `roles/storage.objectAdmin` on `gs://economedia-pts-models` to `sa-ml-train`
+100. Grant `roles/storage.objectViewer` on `gs://economedia-pts-models` to `sa-ml-infer`
+
+---
+
+### Phase 6 — Local configuration files
+
+101. Create `configs/env.yaml`
+102. Commit `configs/env.yaml`
+
+---
+
+### Phase 7 — Build and publish images
+
+103. Build and push training image with `cloudbuild.training.yaml`
+104. Build and push inference image with `cloudbuild.inference.yaml`
+
+---
+
+### Phase 8 — Workflows deployment
+
+105. Deploy `workflows/training_workflow.yaml`
+106. Set `sa-workflows` as the service account for `training_workflow`
+107. Deploy `workflows/inference_workflow.yaml`
+108. Set `sa-workflows` as the service account for `inference_workflow`
+
+---
+
+### Phase 9 — Scheduler
+
+109. Create Cloud Scheduler job `training-quarterly`
+110. Create Cloud Scheduler job `inference-daily`
+
+---
+
+### Phase 10 — BigQuery Scheduled Query (features)
+
+111. Create BigQuery scheduled query `features_daily`
+112. Set destination table `propensity_to_subscribe.features_daily` for `features_daily`
+113. Set scheduled query time zone for `features_daily`
+114. Set daily schedule for `features_daily`
+
+---
+
+### Phase 11 — First training run
+
+115. Launch `training_workflow` once
+116. Verify model artifacts uploaded to `gs://economedia-pts-models`
+117. Register model version in Vertex Model Registry
+118. Label model version with `{stage=candidate}`
+
+---
+
+### Phase 12 — Promotion
+
+119. Promote latest candidate model version to `{stage=production}`
+120. Record promoted model version ID
+
+---
+
+### Phase 13 — First inference run
+
+121. Launch `inference_workflow` once with `scoring_date`
+122. Verify rows in `propensity_to_subscribe.predictions_daily` for `scoring_date`
+
+---
+
+### Phase 14 — Monitoring and budgets
+
+123. Create billing budget
+124. Create alert policy for Vertex AI job failures
+125. Create alert policy for Workflows execution failures
+126. Create alert policy for BigQuery scheduled query failures
+127. Create alert policy for zero prediction rows per day
+
+---
+
+### Phase 15 — Housekeeping
+
+128. Set partition expiration on `predictions_daily`
+129. Set partition expiration on `features_daily`
+130. Commit and push repository tag `v1.0.0`
+131. Document runbook link in `README.md`

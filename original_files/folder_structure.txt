@@ -1,0 +1,56 @@
+/ (root)
+  README.md
+  .gitignore
+  configs/
+    env.example.yaml
+    env.yaml                 # local-only, not committed; show example content
+    labels.yaml
+    thresholds_policy.yaml
+  app/
+    common/
+      __init__.py
+      io.py
+      bq_utils.py
+      preprocessing.py
+      registry.py
+      utils.py
+    training/
+      __init__.py
+      entrypoint.py          # main() for Vertex Custom Job (training)
+      cv_build.py            # refactor of data engineering -> writes train_data + metadata
+      train.py               # refactor of model_training -> tuning, fit, calibrate, metrics
+      artifact_io.py         # save/load models + calibrators to GCS + register in Model Registry
+      metrics_to_bq.py       # write metrics to BigQuery
+      sql/
+        build_training_dataset.sql
+    inference/
+      __init__.py
+      entrypoint.py          # main() for Vertex Custom Job (inference)
+      batch_predict.py       # read features, load production model, write predictions to BQ
+      schema.py              # BQ schemas (predictions, features)
+  bq/
+    ddl/
+      create_predictions_daily.sql
+      create_train_metrics.sql
+      create_feature_views.sql
+    scheduled_queries/
+      features_daily.sql     # daily features materialization
+  containers/
+    training.Dockerfile
+    inference.Dockerfile
+    requirements-training.txt
+    requirements-inference.txt
+  workflows/
+    training_workflow.yaml   # launches training Custom Job; registers model; writes status
+    inference_workflow.yaml  # launches inference Custom Job; writes BQ partition
+  cloudbuild/
+    cloudbuild.training.yaml
+    cloudbuild.inference.yaml
+    cloudbuild.all.yaml
+  scripts/
+    gcloud_bootstrap.sh
+    deploy_workflows.sh
+    schedule_jobs.sh
+    create_scheduled_query.sh
+  infra/terraform/           # optional; only if I request IaC
+    main.tf  variables.tf  iam.tf  artifact_registry.tf  storage.tf  bigquery.tf  workflows.tf  scheduler.tf
