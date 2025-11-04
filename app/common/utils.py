@@ -1,12 +1,8 @@
-"""
-Provided helpers:
-- get_logger(name, level): lightweight logger setup (no behavior change to model).
-- make_run_id(): time-based run ID for artifact folders/logs.
-- utcnow_iso(): UTC timestamp string for metadata.
-- sha256_file(path), sha256_string(s): compute SHAs for governance/metadata.
-- dict_to_sorted_json(d): deterministic JSON (useful for hashing metadata).
-- get_git_sha(): best-effort current Git commit SHA (returns None if unavailable).
-- file_sha_or_none(path): safe wrapper that returns None if file missing.
+"""Miscellaneous utilities shared by training and inference code.
+
+Highlights:
+- :func:`get_git_sha` - best-effort current Git commit SHA (``None`` if unavailable).
+- :func:`file_sha_or_none` - safe SHA-256 helper that tolerates missing files.
 """
 
 from __future__ import annotations
