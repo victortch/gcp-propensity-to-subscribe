@@ -1,18 +1,16 @@
-"""
-Daily batch inference for the Economedia PTS engine.
+"""Batch inference logic for the Economedia PTS project.
 
-Behavior preserved:
-- Feature prep mirrors the training's drop/cast rules (no one-hot): drop id/meta & y_*,
-  cast numerics to float32, non-numerics -> categorical codes -> float32, fillna(0.0).
-- Per-label scoring uses the XGBoost model trained in Step 17 and isotonic calibrator
-  (if present), then applies the stored/overridden threshold to produce a decision.
+- Feature preprocessing mirrors training (cast numerics to ``float32``,
+  categorical codes for non-numerics, fill ``NaN`` with ``0.0``).
+- Per-label scoring uses the XGBoost model trained offline and optional isotonic
+  calibrator, then applies the stored/overridden threshold to produce decisions.
 
 Inputs:
-- BigQuery: propensity_to_subscribe.features_daily (one row per user for scoring_date)
-- Artifacts in GCS under a Vertex AI Model Registry "production" version's artifact_uri
+- BigQuery ``propensity_to_subscribe.features_daily`` (one row per user for ``scoring_date``)
+- Artifacts in GCS under the Vertex AI Model Registry production version ``artifact_uri``
 
 Outputs:
-- BigQuery: propensity_to_subscribe.predictions_daily (one row per user per label)
+- BigQuery ``propensity_to_subscribe.predictions_daily`` (one row per user per label)
 
 This module does not alter training logic or data processing semantics.
 """
