@@ -5,6 +5,7 @@
 DECLARE run_date DATE DEFAULT @run_date;
 DECLARE target_date DATE DEFAULT IFNULL(run_date, DATE_SUB(CURRENT_DATE('Europe/Sofia'), INTERVAL 1 DAY));
 DECLARE start_date DATE DEFAULT DATE '2018-01-01';
+DECLARE freeze_date DATE DEFAULT DATE_ADD(target_date, INTERVAL 90 DAY);
 DECLARE dne_start DATE DEFAULT DATE '2018-01-01';
 DECLARE cap_wall1_offer_start DATE DEFAULT DATE '2019-01-01';
 
@@ -56,7 +57,7 @@ orders_raw AS (
   JOIN `economedia-data-prod-laoy.ecommerce.orderdetails` b ON a.id = b.orderid
   LEFT JOIN `economedia-data-prod-laoy.ecommerce.ordersubscription` c ON b.id = c.orderdetailsid
   LEFT JOIN stop_log sl ON a.id = sl.orderid
-  WHERE DATE(a.createdate) BETWEEN start_date AND target_date
+  WHERE DATE(a.createdate) >= start_date
     AND a.lguserid IS NOT NULL
     AND a.lguserid NOT IN (SELECT lguserid FROM corporate)
 ),
@@ -139,7 +140,7 @@ orders_daily AS (
     COUNTIF(state<>1) AS orders_fail_cnt,
     SUM(CASE WHEN state=1 AND totalprice>0 THEN totalprice ELSE 0 END) AS paid_amount
   FROM orders_raw
-  WHERE DATE(created_ts) BETWEEN start_date AND target_date
+  WHERE DATE(created_ts) BETWEEN start_date AND freeze_date
   GROUP BY 1,2
 ),
 orders_cum AS (
@@ -164,13 +165,13 @@ free_sub_ever AS (
 pv_daily AS (
   SELECT lguserid, DATE(datetime) AS date, sid, COUNT(*) AS pv_count
   FROM `economedia-data-prod-laoy.public.paywall_log_main`
-  WHERE DATE(datetime) BETWEEN start_date AND target_date
+  WHERE DATE(datetime) BETWEEN start_date AND freeze_date
     AND sid IN (1,2) AND COALESCE(lguserid,0) > 0
   GROUP BY 1,2,3
   UNION ALL
   SELECT lguserid, DATE(datetime) AS date, sid, COUNT(*) AS pv_count
   FROM `economedia-data-prod-laoy.public.paywall_log_archive_full`
-  WHERE DATE(datetime) BETWEEN start_date AND target_date
+  WHERE DATE(datetime) BETWEEN start_date AND freeze_date
     AND sid IN (1,2) AND COALESCE(lguserid,0) > 0
   GROUP BY 1,2,3
 ),
@@ -198,7 +199,7 @@ pv_users AS (
 walls_daily AS (
   SELECT lguserid, DATE(date) AS date, sid, wall
   FROM `economedia-data-prod-laoy.public.lgusers_wall_full`
-  WHERE DATE(date) BETWEEN start_date AND target_date
+  WHERE DATE(date) BETWEEN start_date AND freeze_date
     AND lguserid IS NOT NULL
 ),
 walls_offer_daily AS (
@@ -223,7 +224,7 @@ newsletter_daily AS (
   FROM `economedia-data-prod-laoy.public.newsletter` n
   LEFT JOIN `economedia-data-prod-laoy.public.lgusers` lg
     ON (lg.email = n.email OR n.lguserid = lg.lguserid)
-  WHERE n.active = 1 AND n.sid IN (1,2) AND DATE(n.regdate) BETWEEN start_date AND target_date
+  WHERE n.active = 1 AND n.sid IN (1,2) AND DATE(n.regdate) BETWEEN start_date AND freeze_date
 ),
 newsletter_daily_pivot AS (
   SELECT lguserid, date,
@@ -237,7 +238,7 @@ newsletter_daily_pivot AS (
 rfv_raw AS (
   SELECT lguserid, DATE(date) AS date, sid, recency, frequency, volume, rfv
   FROM `economedia-data-prod-laoy.public.lgusers_rfv`
-  WHERE sid IN (1,2) AND DATE(date) BETWEEN start_date AND target_date
+  WHERE sid IN (1,2) AND DATE(date) BETWEEN start_date AND freeze_date
 ),
 rfv_daily AS (
   SELECT lguserid, date, sid,
@@ -334,26 +335,87 @@ next_flags AS (
 
 
 
+-- 17) Apply inclusion logic & cleanups
 index_filtered AS (
   SELECT
-    ia.lguserid,
-    ia.date,
-    ia.active_cap_any,
-    ia.active_cap_valid,
-    ia.active_dne_any,
-    ia.active_dne_valid,
-    nf.next_cap_is_valid,
-    nf.next_dne_is_valid,
-    (NOT ia.active_cap_valid AND NOT ia.active_cap_any AND (nf.next_cap_is_valid IS NULL OR nf.next_cap_is_valid = TRUE)) AS candidate_cap,
-    (ia.date >= dne_start AND NOT ia.active_dne_valid AND NOT ia.active_dne_any AND (nf.next_dne_is_valid IS NULL OR nf.next_dne_is_valid = TRUE)) AS candidate_dne
+    ia.lguserid, ia.date,
+    ia.active_cap_any, ia.active_cap_valid, ia.active_dne_any, ia.active_dne_valid,
+    nf.next_cap_is_valid, nf.next_dne_is_valid
   FROM index_active ia
   JOIN next_flags nf USING (lguserid, date)
-  WHERE ia.date = target_date
-    AND (
-      (NOT ia.active_cap_valid AND NOT ia.active_cap_any AND (nf.next_cap_is_valid IS NULL OR nf.next_cap_is_valid = TRUE))
-      OR
-      (ia.date >= dne_start AND NOT ia.active_dne_valid AND NOT ia.active_dne_any AND (nf.next_dne_is_valid IS NULL OR nf.next_dne_is_valid = TRUE))
-    )
+  WHERE
+    -- At least one media is eligible on this date and NEXT for that media is not invalid
+
+    (NOT ia.active_cap_valid AND NOT ia.active_cap_any AND (nf.next_cap_is_valid IS NULL OR nf.next_cap_is_valid = TRUE))
+    OR
+    (ia.date >= dne_start AND NOT ia.active_dne_valid AND NOT ia.active_dne_any AND (nf.next_dne_is_valid IS NULL OR nf.next_dne_is_valid = TRUE))
+    
+),
+
+
+-- 18) Labels via JOIN + aggregation (90 and 30 days only)
+labels_counts AS (
+  SELECT
+    i.*,
+
+    -- Capital: any valid future order within 90d?
+    COUNTIF(s.media='capital' AND s.is_valid
+            AND s.created_ts <= TIMESTAMP_ADD(TIMESTAMP(i.date), INTERVAL 90 DAY)) > 0 AS cap_in_90d,
+    
+    -- Capital: any valid future order within 30d?
+    COUNTIF(s.media='capital' AND s.is_valid
+            AND s.created_ts <= TIMESTAMP_ADD(TIMESTAMP(i.date), INTERVAL 30 DAY)) > 0 AS cap_in_30d,
+
+    -- Dnevnik: any valid future order within 90d?
+    COUNTIF(s.media='dnevnik' AND s.is_valid
+            AND s.created_ts <= TIMESTAMP_ADD(TIMESTAMP(i.date), INTERVAL 90 DAY)) > 0 AS dne_in_90d,
+    
+    -- Dnevnik: any valid future order within 30d?
+    COUNTIF(s.media='dnevnik' AND s.is_valid
+            AND s.created_ts <= TIMESTAMP_ADD(TIMESTAMP(i.date), INTERVAL 30 DAY)) > 0 AS dne_in_30d
+
+  FROM index_filtered i
+  LEFT JOIN subs_orders_sorted s
+    ON s.lguserid = i.lguserid
+   AND s.is_valid = TRUE
+   AND s.created_ts > TIMESTAMP(i.date)
+   AND s.media IN ('capital','dnevnik')
+  GROUP BY
+    i.lguserid, i.date,
+    i.active_cap_any, i.active_cap_valid, i.active_dne_any, i.active_dne_valid,
+    i.next_cap_is_valid, i.next_dne_is_valid
+),
+
+
+labels AS (
+  SELECT
+    lc.* EXCEPT(cap_in_90d, dne_in_90d, cap_in_30d, dne_in_30d),
+
+    -- Capital 90d label with NA masking for active/censored
+    CASE
+      WHEN lc.active_cap_any OR lc.date > DATE_SUB(freeze_date, INTERVAL 90 DAY)
+      THEN NULL ELSE lc.cap_in_90d
+    END AS y_cap_90d,
+    
+    -- Capital 30d label with NA masking for active/censored
+    CASE
+      WHEN lc.active_cap_any OR lc.date > DATE_SUB(freeze_date, INTERVAL 30 DAY)
+      THEN NULL ELSE lc.cap_in_30d
+    END AS y_cap_30d,
+
+    -- Dnevnik 90d label with NA masking for pre-start/active/censored
+    CASE
+      WHEN lc.date < dne_start OR lc.active_dne_any OR lc.date > DATE_SUB(freeze_date, INTERVAL 90 DAY)
+      THEN NULL ELSE lc.dne_in_90d
+    END AS y_dne_90d,
+    
+    -- Dnevnik 30d label with NA masking for pre-start/active/censored
+    CASE
+      WHEN lc.date < dne_start OR lc.active_dne_any OR lc.date > DATE_SUB(freeze_date, INTERVAL 30 DAY)
+      THEN NULL ELSE lc.dne_in_30d
+    END AS y_dne_30d
+    
+  FROM labels_counts lc
 ),
 
 -- 19) Build daily signal table (one row per user-date where any event happened)
@@ -498,16 +560,16 @@ rolling AS (
 -- Pick latest orders_cum row ≤ index date (per user-date)
 oc_latest AS (
   SELECT
-    idx.lguserid, idx.date,
+    l.lguserid, l.date,
     oc.cum_paid_amount, oc.cum_fail_cnt,
     ROW_NUMBER() OVER (
-      PARTITION BY idx.lguserid, idx.date
+      PARTITION BY l.lguserid, l.date
       ORDER BY oc.date DESC
     ) AS rn
-  FROM index_filtered idx
+  FROM labels l
   LEFT JOIN orders_cum oc
-    ON oc.lguserid = idx.lguserid
-   AND oc.date     <= idx.date
+    ON oc.lguserid = l.lguserid
+   AND oc.date     <= l.date
 ),
 oc_pick AS (
   SELECT
@@ -523,15 +585,15 @@ oc_pick AS (
 -- Pick latest subs_days_cum row (< index date) per media
 subs_days_latest AS (
   SELECT
-    idx.lguserid, idx.date, s.media, s.cum_days_covered_upto_date,
+    l.lguserid, l.date, s.media, s.cum_days_covered_upto_date,
     ROW_NUMBER() OVER (
-      PARTITION BY idx.lguserid, idx.date, s.media
+      PARTITION BY l.lguserid, l.date, s.media
       ORDER BY s.date DESC
     ) AS rn
-  FROM index_filtered idx
+  FROM labels l
   LEFT JOIN subs_days_cum s
-    ON s.lguserid = idx.lguserid
-   AND s.date     <  idx.date
+    ON s.lguserid = l.lguserid
+   AND s.date     <  l.date
    AND s.media    IN ('capital','dnevnik','other')
 ),
 subs_days_pick AS (
@@ -548,16 +610,16 @@ subs_days_pick AS (
 -- Last payment outcome before/on index date (0=no prior, 1=last unsuccessful, 2=last successful)
 last_payment_latest AS (
   SELECT
-    idx.lguserid, idx.date,
+    l.lguserid, l.date,
     CASE WHEN o.state = 1 THEN 2 ELSE 1 END AS last_payment_outcome,
     ROW_NUMBER() OVER (
-      PARTITION BY idx.lguserid, idx.date
+      PARTITION BY l.lguserid, l.date
       ORDER BY o.created_ts DESC
     ) AS rn
-  FROM index_filtered idx
+  FROM labels l
   LEFT JOIN orders_raw o
-    ON o.lguserid = idx.lguserid
-   AND DATE(o.created_ts) <= idx.date
+    ON o.lguserid = l.lguserid
+   AND DATE(o.created_ts) <= l.date
 ),
 last_payment_pick AS (
   SELECT lguserid, date, IFNULL(last_payment_outcome, 0) AS last_payment_outcome
@@ -568,29 +630,34 @@ last_payment_pick AS (
 -- Ever free subscription before index date (per media)
 free_flags AS (
   SELECT
-    idx.lguserid, idx.date,
+    l.lguserid, l.date,
     -- Exists any free sub earlier?
     IF(COUNTIF(f.media='capital')>0, 1, 0) AS had_prev_free_cap,
     IF(COUNTIF(f.media='dnevnik')>0, 1, 0) AS had_prev_free_dne
-  FROM index_filtered idx
+  FROM labels l
   LEFT JOIN free_sub_ever f
-    ON f.lguserid = idx.lguserid
-   AND f.first_free_date < idx.date
-  GROUP BY idx.lguserid, idx.date
+    ON f.lguserid = l.lguserid
+   AND f.first_free_date < l.date
+  GROUP BY l.lguserid, l.date
 ),
 
 
 -- 21) Final assembly: labels + features (join rolling + rfv + orders cum + active flags + totals)
 final AS (
   SELECT
-    idx.lguserid AS user_id,
-    idx.date,
-    idx.candidate_cap,
-    idx.candidate_dne,
+    l.lguserid AS user_id,
+    l.date,
+
+    -- Labels (nullable INT64)
+
+    NULL AS y_cap_90d,
+    NULL AS y_cap_30d,  
+    NULL AS y_dne_90d,
+    NULL AS y_dne_30d, 
 
     -- Current active counts per media (0/1)
-    IF(idx.active_cap_valid, 1, 0) AS active_cap_count,
-    IF(idx.active_dne_valid, 1, 0) AS active_dne_count,
+    IF(l.active_cap_valid, 1, 0) AS active_cap_count,
+    IF(l.active_dne_valid, 1, 0) AS active_dne_count,
 
     -- Rolling features
     r.pv_cap_7d,  r.pv_cap_30d,  r.pv_cap_60d,  r.pv_cap_90d,  r.pv_cap_all,
@@ -648,23 +715,22 @@ final AS (
     lpp.last_payment_outcome,
 
     -- Keep active flags
-    idx.active_cap_valid,
-    idx.active_dne_valid
+    l.active_cap_valid, l.active_dne_valid
 
-  FROM index_filtered idx
-  LEFT JOIN rolling         r    ON r.lguserid = idx.lguserid AND r.date = idx.date
-  LEFT JOIN rfv_pivot       rp   ON rp.lguserid = idx.lguserid AND rp.date = idx.date
-  LEFT JOIN oc_pick         ocp  ON ocp.lguserid = idx.lguserid AND ocp.date = idx.date
-  LEFT JOIN subs_days_pick  sdp  ON sdp.lguserid = idx.lguserid AND sdp.date = idx.date
-  LEFT JOIN last_payment_pick lpp ON lpp.lguserid = idx.lguserid AND lpp.date = idx.date
-  LEFT JOIN free_flags      ff   ON ff.lguserid = idx.lguserid AND ff.date = idx.date
+  FROM labels l
+  LEFT JOIN rolling         r    ON r.lguserid = l.lguserid AND r.date = l.date
+  LEFT JOIN rfv_pivot       rp   ON rp.lguserid = l.lguserid AND rp.date = l.date
+  LEFT JOIN oc_pick         ocp  ON ocp.lguserid = l.lguserid AND ocp.date = l.date
+  LEFT JOIN subs_days_pick  sdp  ON sdp.lguserid = l.lguserid AND sdp.date = l.date
+  LEFT JOIN last_payment_pick lpp ON lpp.lguserid = l.lguserid AND lpp.date = l.date
+  LEFT JOIN free_flags      ff   ON ff.lguserid = l.lguserid AND ff.date = l.date
 )
 
 
 -- 22) Join demographics (snapshot), leave imputation to Python
 SELECT
   target_date AS scoring_date,
-  f.* EXCEPT(candidate_cap, candidate_dne),
+  f.*,
   d.education, d.workpos, d.sex,
   -- Missingness indicators for RFV (non-cumulative sparse vars) – handy in Python too
   IF(recency_cap IS NULL, 1, 0) AS miss_recency_cap,
@@ -682,5 +748,5 @@ LEFT JOIN pv_users u
   ON u.lguserid = f.user_id
 WHERE
   f.date = target_date
-  AND NOT (f.candidate_cap AND (COALESCE(u.has_cap_pv, FALSE) = FALSE))
-  AND NOT (f.candidate_dne AND (COALESCE(u.has_dne_pv, FALSE) = FALSE));
+  AND NOT ( (f.y_cap_90d IS NOT NULL OR f.y_cap_30d IS NOT NULL) AND (COALESCE(u.has_cap_pv, FALSE) = FALSE) )
+  AND NOT ( (f.y_dne_90d IS NOT NULL OR f.y_dne_30d IS NOT NULL) AND (COALESCE(u.has_dne_pv, FALSE) = FALSE) );
