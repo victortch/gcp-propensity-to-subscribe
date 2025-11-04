@@ -1,0 +1,12 @@
+# Cloud Build config to build and push the inference image to Artifact Registry.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=containers/inference.Dockerfile
+      - --tag=$_IMAGE_URI
+      - .
+images:
+  - $_IMAGE_URI
+substitutions:
+  _IMAGE_URI: europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/inference:latest
