@@ -333,6 +333,9 @@ bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION
   < bq/ddl/create_train_metrics.sql
 
 bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
+  < bq/ddl/create_features_daily.sql
+
+bq query --use_legacy_sql=false --project_id=${PROJECT_ID} --location=${LOCATION} \
   < bq/ddl/create_feature_views.sql
 \end{verbatim}
 If the dataset already exists, the \code{mk} command returns an error; this is safe to ignore.
