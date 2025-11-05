@@ -1,0 +1,78 @@
+# Cloud Workflow: quarterly training job orchestration for Economedia PTS.
+# Launches a Vertex AI Custom Job running the training container with
+# explicit window parameters.
+
+main:
+  params: [
+    project_id,
+    region,
+    start_date,
+    freeze_date,
+    dne_start,
+    cap_wall1_offer_start,
+    primary_label,
+    training_image,
+    machine_type,
+    service_account
+  ]
+  steps:
+    - defaults:
+        assign:
+          - project: ${project_id or "economedia-data-prod-laoy"}
+          - location: ${region or "europe-west3"}
+          - image: ${training_image or "europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/training:latest"}
+          - machine: ${machine_type or "e2-standard-4"}
+          - sa: ${service_account or "sa-ml-train@economedia-data-prod-laoy.iam.gserviceaccount.com"}
+          - run_id: ${sys.uuid()}
+          - resolved_freeze: ${freeze_date or time.format(time.add(sys.now(), duration("-P7D")), "%Y-%m-%d")}
+          - resolved_start: ${start_date or "2024-10-01"}
+          - resolved_dne_start: ${dne_start or "2024-10-01"}
+          - resolved_cap_start: ${cap_wall1_offer_start or "2024-10-01"}
+          - base_args: [
+              "--start_date", ${resolved_start},
+              "--freeze_date", ${resolved_freeze},
+              "--dne_start", ${resolved_dne_start},
+              "--cap_wall1_offer_start", ${resolved_cap_start}
+            ]
+          - args: ${primary_label ? base_args + ["--primary_label", primary_label] : base_args}
+    - launch_training:
+        call: googleapis.aiplatform.v1.projects.locations.customJobs.create
+        args:
+          parent: ${"projects/" + project + "/locations/" + location}
+          body:
+            displayName: ${"pts-training-" + run_id[:8]}
+            jobSpec:
+              serviceAccount: ${sa}
+              workerPoolSpecs:
+                - machineSpec:
+                    machineType: ${machine}
+                  replicaCount: 1
+                  containerSpec:
+                    imageUri: ${image}
+                    args: ${args}
+        result: training_job
+    - wait_initial:
+        call: sys.sleep
+        args:
+          seconds: 30
+    - poll_status:
+        call: googleapis.aiplatform.v1.projects.locations.customJobs.get
+        args:
+          name: ${training_job.name}
+        result: job_state
+    - check_status:
+        switch:
+          - condition: ${job_state.state == "JOB_STATE_SUCCEEDED"}
+            return:
+              message: "Training completed"
+              customJobName: ${training_job.name}
+              runId: ${run_id}
+          - condition: ${job_state.state in ["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_PAUSED"]}
+            raise: ${"Training job ended with state " + job_state.state}
+          - default:
+              next: wait_loop
+    - wait_loop:
+        call: sys.sleep
+        args:
+          seconds: 60
+        next: poll_status

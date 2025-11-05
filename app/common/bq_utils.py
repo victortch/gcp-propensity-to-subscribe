@@ -1,13 +1,8 @@
-"""
-BigQuery utility functions shared by training and inference.
+"""BigQuery convenience helpers for the Economedia PTS project.
 
-These are lightweight wrappers for:
-  • dataset and table existence checks
-  • dataset/table creation (idempotent)
-  • schema helpers for JSON/DDL integration
-
-Used by app/training/metrics_to_bq.py and app/inference/batch_predict.py
-to ensure required tables exist before writing.
+Lightweight wrappers for dataset/table existence checks, creation, and
+schema serialization. Used by training and inference modules to ensure
+required datasets/tables exist before reading or writing.
 """
 
 from __future__ import annotations
