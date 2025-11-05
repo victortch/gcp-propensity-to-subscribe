@@ -20,8 +20,9 @@ main:
           - machine: ${machine_type or "e2-standard-4"}
           - sa: ${service_account or "sa-ml-infer@economedia-data-prod-laoy.iam.gserviceaccount.com"}
           - run_id: ${sys.uuid()}
+          - resolved_scoring_date: ${scoring_date or time.format(time.add(sys.now(), duration("-P1D")), "%Y-%m-%d")}
           - args: [
-              "--scoring_date", ${scoring_date}
+              "--scoring_date", ${resolved_scoring_date}
             ]
     - launch_inference:
         call: googleapis.aiplatform.v1.projects.locations.customJobs.create
@@ -54,7 +55,7 @@ main:
             return:
               message: "Inference completed"
               customJobName: ${inference_job.name}
-              scoringDate: ${scoring_date}
+              scoringDate: ${resolved_scoring_date}
           - condition: ${job_state.state in ["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_PAUSED"]}
             raise: ${"Inference job ended with state " + job_state.state}
           - default:

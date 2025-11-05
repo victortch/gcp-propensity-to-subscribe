@@ -24,11 +24,15 @@ main:
           - machine: ${machine_type or "e2-standard-4"}
           - sa: ${service_account or "sa-ml-train@economedia-data-prod-laoy.iam.gserviceaccount.com"}
           - run_id: ${sys.uuid()}
+          - resolved_freeze: ${freeze_date or time.format(time.add(sys.now(), duration("-P7D")), "%Y-%m-%d")}
+          - resolved_start: ${start_date or "2024-10-01"}
+          - resolved_dne_start: ${dne_start or "2024-10-01"}
+          - resolved_cap_start: ${cap_wall1_offer_start or "2024-10-01"}
           - base_args: [
-              "--start_date", ${start_date},
-              "--freeze_date", ${freeze_date},
-              "--dne_start", ${dne_start},
-              "--cap_wall1_offer_start", ${cap_wall1_offer_start}
+              "--start_date", ${resolved_start},
+              "--freeze_date", ${resolved_freeze},
+              "--dne_start", ${resolved_dne_start},
+              "--cap_wall1_offer_start", ${resolved_cap_start}
             ]
           - args: ${primary_label ? base_args + ["--primary_label", primary_label] : base_args}
     - launch_training:
