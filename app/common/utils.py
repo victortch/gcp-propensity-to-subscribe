@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -50,6 +51,19 @@ def make_run_id() -> str:
 def utcnow_iso() -> str:
     """UTC timestamp in ISO format (for metadata fields)."""
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def sanitize_for_bq_label(value: str, prefix: str = "r") -> str:
+    """Return a string compatible with BigQuery / Vertex label constraints."""
+
+    safe = value.lower()
+    safe = re.sub(r"[^a-z0-9_-]", "-", safe)
+    safe = safe.strip("-")
+    if not safe:
+        safe = prefix
+    if not safe[0].isalpha():
+        safe = f"{prefix}{safe}"
+    return safe[:63]
 
 
 # ---------------------------------------------------------------------

@@ -1,5 +1,5 @@
 bayesian-optimization==1.4.3
-cloud-log-handler==0.2.1
+db-dtypes==1.1.1
 google-cloud-aiplatform==1.45.0
 google-cloud-bigquery==3.12.0
 google-cloud-bigquery-storage==2.24.0

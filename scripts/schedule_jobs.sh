@@ -52,7 +52,6 @@ payload = {
 }
 
 overrides = [
-    ("INFERENCE_SCORING_DATE", "scoring_date"),
     ("INFERENCE_IMAGE", "inference_image"),
     ("INFERENCE_MACHINE_TYPE", "machine_type"),
     ("INFERENCE_SERVICE_ACCOUNT", "service_account"),
