@@ -29,7 +29,7 @@ from google.cloud import bigquery
 from google.cloud.bigquery import QueryJobConfig, SchemaUpdateOption
 
 from app.common.io import get_bq_client, get_bqstorage_client
-from app.common.utils import get_logger
+from app.common.utils import get_logger, sanitize_for_bq_label
 
 # ------------------------
 # Constants (defaults come from env in entrypoint)
@@ -181,6 +181,7 @@ def upload_meta_to_bq(records: List[Dict[str, Any]], meta_table_fqn: str, run_id
     bq = get_bq_client(PROJECT_ID, BQ_LOCATION)
     ensure_dataset(meta_table_fqn.split(".")[1])
     df = pd.DataFrame.from_records(records)
+    label_value = sanitize_for_bq_label(run_id)
     # keep JSON-like types as strings to avoid struct inference issues
     schema = [
         bigquery.SchemaField("run_id", "STRING"),
@@ -212,7 +213,7 @@ def upload_meta_to_bq(records: List[Dict[str, Any]], meta_table_fqn: str, run_id
             write_disposition="WRITE_APPEND",
             schema=schema,
             schema_update_options=[SchemaUpdateOption.ALLOW_FIELD_ADDITION],
-            labels={"run_id": run_id, "dest": "cv_build_metadata"},
+            labels={"run_id": label_value, "dest": "cv_build_metadata"},
         ),
     )
     job.result()
@@ -230,11 +231,11 @@ def upload_df_to_bq(df: pd.DataFrame, table_fqn: str, run_id: str):
     for b in [c for c in df.columns if str(df[c].dtype) == "boolean"]:
         df[b] = df[b].astype("Int64")
 
-    safe = run_id.replace("/", "_").replace(":", "_")
+    label_value = sanitize_for_bq_label(run_id)
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_APPEND",
         schema_update_options=[SchemaUpdateOption.ALLOW_FIELD_ADDITION],
-        labels={"run_id": safe, "dest": "train_data"},
+        labels={"run_id": label_value, "dest": "train_data"},
     )
     job = bq.load_table_from_dataframe(df, table_fqn, job_config=job_config)
     job.result()

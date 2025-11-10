@@ -1,8 +1,9 @@
-"""
-- Drop id/meta columns, anything ending with '_id', and all 'y_*' columns.
-- Numeric columns -> float32.
-- Non-numeric columns -> categorical codes -> float32.
-- Fill remaining NaNs with 0.0.
+"""Shared preprocessing helpers for training and inference.
+
+Mirrors behavior from the legacy local training script:
+    * Numeric columns -> ``float32``
+    * Non-numeric columns -> categorical codes -> ``float32``
+    * Remaining ``NaN`` values filled with ``0.0``
 """
 
 from __future__ import annotations

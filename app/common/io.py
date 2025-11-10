@@ -1,22 +1,12 @@
-"""
-I/O utilities shared by training and inference.
+"""Input/Output helpers used across the Economedia PTS project.
 
-- Config:
-    load_env_config(): load configs/env.yaml (local-only) with fallback to configs/env.example.yaml,
-    with optional environment variable overrides.
-
-- Google Cloud Storage (GCS):
-    gcs_parse_uri(), gcs_download_bytes(), gcs_upload_bytes(),
-    gcs_download_json(), gcs_upload_json(),
-    gcs_download_file(), gcs_upload_file()
-
-- BigQuery:
-    get_bq_client(), get_bqstorage_client(),
-    bq_query_to_df(), bq_load_dataframe()
+Utilities exposed:
+    • :func:`get_bq_client`, :func:`get_bqstorage_client`
+    • :func:`bq_query_to_df`, :func:`bq_load_dataframe`
 
 Notes:
 - In Vertex AI jobs we rely on Application Default Credentials (workload identity / SA on the job).
-- Locally you can authenticate with: `gcloud auth application-default login`.
+- Locally you can authenticate with: ``gcloud auth application-default login``.
 """
 
 from __future__ import annotations

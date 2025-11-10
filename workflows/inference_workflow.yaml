@@ -1,0 +1,67 @@
+# Cloud Workflow: daily inference orchestration for Economedia PTS.
+# Launches a Vertex AI Custom Job that executes the batch inference container
+# with the provided scoring date.
+
+main:
+  params: [
+    project_id,
+    region,
+    scoring_date,
+    inference_image,
+    machine_type,
+    service_account
+  ]
+  steps:
+    - defaults:
+        assign:
+          - project: ${project_id or "economedia-data-prod-laoy"}
+          - location: ${region or "europe-west3"}
+          - image: ${inference_image or "europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/inference:latest"}
+          - machine: ${machine_type or "e2-standard-4"}
+          - sa: ${service_account or "sa-ml-infer@economedia-data-prod-laoy.iam.gserviceaccount.com"}
+          - run_id: ${sys.uuid()}
+          - resolved_scoring_date: ${scoring_date or time.format(time.add(sys.now(), duration("-P1D")), "%Y-%m-%d")}
+          - args: [
+              "--scoring_date", ${resolved_scoring_date}
+            ]
+    - launch_inference:
+        call: googleapis.aiplatform.v1.projects.locations.customJobs.create
+        args:
+          parent: ${"projects/" + project + "/locations/" + location}
+          body:
+            displayName: ${"pts-inference-" + run_id[:8]}
+            jobSpec:
+              serviceAccount: ${sa}
+              workerPoolSpecs:
+                - machineSpec:
+                    machineType: ${machine}
+                  replicaCount: 1
+                  containerSpec:
+                    imageUri: ${image}
+                    args: ${args}
+        result: inference_job
+    - wait_initial:
+        call: sys.sleep
+        args:
+          seconds: 20
+    - poll_status:
+        call: googleapis.aiplatform.v1.projects.locations.customJobs.get
+        args:
+          name: ${inference_job.name}
+        result: job_state
+    - check_status:
+        switch:
+          - condition: ${job_state.state == "JOB_STATE_SUCCEEDED"}
+            return:
+              message: "Inference completed"
+              customJobName: ${inference_job.name}
+              scoringDate: ${resolved_scoring_date}
+          - condition: ${job_state.state in ["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_PAUSED"]}
+            raise: ${"Inference job ended with state " + job_state.state}
+          - default:
+              next: wait_loop
+    - wait_loop:
+        call: sys.sleep
+        args:
+          seconds: 30
+        next: poll_status
