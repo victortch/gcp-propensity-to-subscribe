@@ -181,7 +181,7 @@ def upload_meta_to_bq(records: List[Dict[str, Any]], meta_table_fqn: str, run_id
     bq = get_bq_client(PROJECT_ID, BQ_LOCATION)
     ensure_dataset(meta_table_fqn.split(".")[1])
     df = pd.DataFrame.from_records(records)
-    label_value = RUN_ID_LABEL if run_id == RUN_ID else sanitize_for_bq_label(run_id)
+    label_value = sanitize_for_bq_label(run_id)
     # keep JSON-like types as strings to avoid struct inference issues
     schema = [
         bigquery.SchemaField("run_id", "STRING"),
@@ -231,7 +231,7 @@ def upload_df_to_bq(df: pd.DataFrame, table_fqn: str, run_id: str):
     for b in [c for c in df.columns if str(df[c].dtype) == "boolean"]:
         df[b] = df[b].astype("Int64")
 
-    label_value = RUN_ID_LABEL if run_id == RUN_ID else sanitize_for_bq_label(run_id)
+    label_value = sanitize_for_bq_label(run_id)
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_APPEND",
         schema_update_options=[SchemaUpdateOption.ALLOW_FIELD_ADDITION],
