@@ -1,12 +1,8 @@
-"""
-Provided helpers:
-- get_logger(name, level): lightweight logger setup (no behavior change to model).
-- make_run_id(): time-based run ID for artifact folders/logs.
-- utcnow_iso(): UTC timestamp string for metadata.
-- sha256_file(path), sha256_string(s): compute SHAs for governance/metadata.
-- dict_to_sorted_json(d): deterministic JSON (useful for hashing metadata).
-- get_git_sha(): best-effort current Git commit SHA (returns None if unavailable).
-- file_sha_or_none(path): safe wrapper that returns None if file missing.
+"""Miscellaneous utilities shared by training and inference code.
+
+Highlights:
+- :func:`get_git_sha` - best-effort current Git commit SHA (``None`` if unavailable).
+- :func:`file_sha_or_none` - safe SHA-256 helper that tolerates missing files.
 """
 
 from __future__ import annotations
@@ -15,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -54,6 +51,19 @@ def make_run_id() -> str:
 def utcnow_iso() -> str:
     """UTC timestamp in ISO format (for metadata fields)."""
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def sanitize_for_bq_label(value: str, prefix: str = "r") -> str:
+    """Return a string compatible with BigQuery / Vertex label constraints."""
+
+    safe = value.lower()
+    safe = re.sub(r"[^a-z0-9_-]", "-", safe)
+    safe = safe.strip("-")
+    if not safe:
+        safe = prefix
+    if not safe[0].isalpha():
+        safe = f"{prefix}{safe}"
+    return safe[:63]
 
 
 # ---------------------------------------------------------------------

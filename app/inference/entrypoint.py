@@ -1,14 +1,13 @@
-"""
-Vertex AI Custom Job entrypoint for daily batch inference.
+"""Vertex AI Custom Job entrypoint for daily batch inference.
 
-What this does:
-  - Loads repo/env config (no secrets).
-  - Parses CLI args (e.g., --scoring_date=YYYY-MM-DD).
-  - Calls app.inference.batch_predict.run_inference(...) to:
+Responsibilities:
+  - Load repo/env config (no secrets).
+  - Parse CLI args (e.g., ``--scoring_date=YYYY-MM-DD``).
+  - Invoke :func:`app.inference.batch_predict.run_inference` to:
       * resolve the production model in Vertex AI Model Registry
       * load artifacts from GCS
-      * read features from propensity_to_subscribe.features_daily for scoring_date
-      * write calibrated probabilities + binary decisions into propensity_to_subscribe.predictions_daily
+      * read features from ``propensity_to_subscribe.features_daily`` for ``scoring_date``
+      * write calibrated probabilities + binary decisions into ``propensity_to_subscribe.predictions_daily``
 
 No data-processing or model math is defined here; it's purely orchestration.
 """
