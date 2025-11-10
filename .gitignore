@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+.env
+.envrc
+
+# Mac / OS artifacts
+.DS_Store
+
+# Byte-compiled / compiled
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Local configs
+configs/env.yaml

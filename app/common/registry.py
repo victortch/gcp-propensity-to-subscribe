@@ -1,21 +1,15 @@
-"""
-Vertex AI Model Registry helpers.
-
-These utilities are used by:
-  - training (to register a new model version with run metadata)
-  - promotion (to tag a version as 'production')
-  - inference (to resolve the current production model version and its artifact URI)
+"""Vertex AI Model Registry helpers for the Economedia PTS project.
 
 Notes
 -----
-- We use the high-level `google.cloud.aiplatform` SDK.
+- Uses the high-level :mod:`google.cloud.aiplatform` SDK.
 - Artifacts (models, calibrators, params) remain in GCS; the Registry is a
-  discovery/governance layer pointing at those artifacts via `artifact_uri`.
-- Version aliases (e.g., 'candidate', 'production') are used to promote/demote.
+  discovery/governance layer pointing at those artifacts via ``artifact_uri``.
+- Version aliases (e.g., ``"candidate"``, ``"production"``) are used to promote/demote.
 
 Authentication
 --------------
-- Locally: `gcloud auth application-default login`
+- Locally: ``gcloud auth application-default login``
 - In Vertex AI: service account attached to the Custom Job.
 """
 

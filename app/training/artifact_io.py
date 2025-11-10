@@ -25,6 +25,7 @@ from app.common.registry import (
     register_model_version,
 )
 from app.common.io import load_env_config
+from app.common.utils import sanitize_for_bq_label
 
 
 def _gcs_join(prefix: str, filename: str) -> str:
@@ -129,9 +130,10 @@ def save_and_register_label_run(
     gcs_upload_json(manifest_uri, manifest, indent=2)
 
     # Register into Vertex AI Model Registry
+    run_id_label = sanitize_for_bq_label(run_id)
     labels = {
         "stage": "candidate",
-        "run_id": run_id,
+        "run_id": run_id_label,
         "label": label_tag,
         "group": vertex_model_registry_label,  # discovery label
     }
