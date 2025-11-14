@@ -15,9 +15,13 @@ Authentication
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, Iterable, List, Optional
 
 from google.cloud import aiplatform
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
@@ -57,15 +61,30 @@ def register_model_version(
     Returns:
         aiplatform.Model (the newly registered version)
     """
-    model = aiplatform.Model.upload(
-        display_name=display_name,
-        artifact_uri=artifact_uri,
-        serving_container_image_uri=serving_image_uri,
-        labels=labels or {},
-        metadata=metadata or {},
-        version_aliases=list(version_aliases or []),
+    upload_kwargs = {
+        "display_name": display_name,
+        "artifact_uri": artifact_uri,
+        "serving_container_image_uri": serving_image_uri,
+        "labels": labels or {},
+        "version_aliases": list(version_aliases or []),
         # No need to set explanation or predict schemata for batch-only workflows.
-    )
+    }
+
+    if metadata:
+        upload_kwargs["metadata"] = metadata
+
+    try:
+        model = aiplatform.Model.upload(**upload_kwargs)
+    except TypeError as exc:
+        if "metadata" in upload_kwargs and "metadata" in str(exc):
+            logger.warning(
+                "Vertex AI SDK rejected model metadata; dropping metadata keys: %s",
+                sorted(upload_kwargs["metadata"].keys()),
+            )
+            upload_kwargs.pop("metadata", None)
+            model = aiplatform.Model.upload(**upload_kwargs)
+        else:
+            raise
     return model
 
 
