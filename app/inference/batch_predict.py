@@ -54,15 +54,45 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------
 
 def _prep_features_like_training(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply the same casting/coding rules as training's prepare_xy_compat."""
-    X = drop_meta_cols(df)
+    """
+    Mirror training's prepare_xy_compat and cv_build.load_base_dataframe post-processing:
+      - Drop meta cols + 'scoring_date'
+      - If demographics flags are missing, synthesize them exactly like training:
+            * parse first integer token from the string
+            * fill NA with 0
+            * add *_missing / *_invalid flags
+      - Cast numerics to float32; non-numerics to categorical codes -> float32; fillna 0.0
+    """
+    dfx = df.copy()
+
+    # Synthesize demographic features like training if they are not already present.
+    # Training logic reference: app/training/cv_build.py load_base_dataframe() step 4.  <-- keeps parity
+    for c in ["education", "workpos", "sex"]:
+        if c in dfx.columns:
+            miss_col = f"{c}_missing"
+            inv_col  = f"{c}_invalid"
+            # Only add if not present (idempotent and backward-compatible with future BQ updates)
+            if miss_col not in dfx.columns or inv_col not in dfx.columns:
+                s = dfx[c].astype("string")
+                miss = s.isna() | s.str.strip().eq("")
+                token = s.str.extract(r"(-?\d+)")[0]
+                num = pd.to_numeric(token, errors="coerce")
+                # Match training fill and dtype; downstream we cast to float32 anyway
+                dfx[c] = num.fillna(0).astype("Int64")
+                dfx[miss_col] = miss.astype("Int8")
+                dfx[inv_col]  = ((~miss) & num.isna()).astype("Int8")
+
+    # Drop meta cols; exclude 'scoring_date' explicitly (training uses 'date', which is dropped)
+    X = drop_meta_cols(dfx, extra_drop=["scoring_date"])
+
+    # Cast per training rules
     for c in X.columns:
         if pd.api.types.is_numeric_dtype(X[c]):
             X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
         else:
             X[c] = X[c].astype("category").cat.codes.astype("float32")
-    X = X.fillna(0.0)
-    return X
+
+    return X.fillna(0.0)
 
 
 def _align_to_feature_names(X: pd.DataFrame, feature_names: Optional[List[str]]) -> pd.DataFrame:

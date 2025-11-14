@@ -4,9 +4,17 @@
 
 DECLARE run_date DATE DEFAULT @run_date;
 DECLARE target_date DATE DEFAULT IFNULL(run_date, DATE_SUB(CURRENT_DATE('Europe/Sofia'), INTERVAL 1 DAY));
-DECLARE start_date DATE DEFAULT DATE '2018-01-01';         -- earliest history needed for *_all windows
-DECLARE dne_start DATE DEFAULT DATE '2018-01-01';          -- first eligible day for Dnevnik offers
-DECLARE cap_wall1_offer_start DATE DEFAULT DATE '2019-01-01'; -- Capital wall logic changed to include offers
+
+-- Match training's default horizon: start_date = freeze_date - 180d.
+-- For inference we set start_date = target_date - 180d so that "*_all" windows
+-- have the same scale the model was trained on near the freeze date.
+DECLARE window_days INT64 DEFAULT 180;
+DECLARE start_date DATE DEFAULT DATE_SUB(target_date, INTERVAL window_days DAY);
+
+-- Use the same default semantics as training workflow (defaults to start_date).
+DECLARE dne_start DATE DEFAULT start_date;
+DECLARE cap_wall1_offer_start DATE DEFAULT start_date;
+
 
 -- Remove any existing rows for the target date before inserting fresh features.
 DELETE FROM `economedia-data-prod-laoy.propensity_to_subscribe.features_daily`
