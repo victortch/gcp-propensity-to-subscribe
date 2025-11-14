@@ -37,7 +37,7 @@ from app.common.io import (
 )
 from app.common.registry import (
     init_ai,
-    resolve_production_version,
+    resolve_production_version_for_label,
     get_artifact_uri,
 )
 from app.common.preprocessing import drop_meta_cols
@@ -122,6 +122,7 @@ class LabelArtifacts:
     model_version_name: str
     artifact_uri: str
     run_id: Optional[str]
+    feature_names: Optional[List[str]]
     manifest: Dict[str, Any]
 
 
@@ -154,8 +155,8 @@ def _load_label_artifacts(
     fallback_threshold: float,
 ) -> LabelArtifacts:
     """
-    Resolve production version, read its manifest.json, load model json,
-    optional isotonic calibrator, and threshold value.
+    Resolve the production version for this label, read its manifest.json,
+    load the persisted model, optional calibrator, threshold, and feature names.
     """
     cfg = load_env_config()
     project_id = cfg["project_id"]
@@ -163,15 +164,19 @@ def _load_label_artifacts(
 
     init_ai(project_id, region)
 
-    m = resolve_production_version(display_name)
-    if m is None:
-        raise RuntimeError(f"No production model found for display_name={display_name}")
-    artifact_uri = get_artifact_uri(m)
+    model_version = resolve_production_version_for_label(display_name, label_tag)
+    if model_version is None:
+        raise RuntimeError(
+            f"No production version found for display_name={display_name} label={label_tag}"
+        )
+    artifact_uri = get_artifact_uri(model_version)
     if not artifact_uri:
-        raise RuntimeError("Production model has no artifact_uri set.")
+        raise RuntimeError("Selected model version has no artifact_uri set.")
 
-    # Manifests are per-label under artifact_uri/<label>/manifest.json
-    # But artifact_uri itself may already be .../<label>. If so, read directly.
+    model_version_name = model_version.resource_name
+    run_id_label = (getattr(model_version, "labels", {}) or {}).get("run_id")
+
+    # Normalize to the label-specific folder (artifact_uri may already point to it)
     if artifact_uri.rstrip("/").endswith(f"/{label_tag}"):
         label_prefix = artifact_uri.rstrip("/")
     else:
@@ -180,23 +185,10 @@ def _load_label_artifacts(
     manifest_uri = f"{label_prefix}/manifest.json"
     manifest = gcs_download_json(manifest_uri)
 
-    # Paths for this label; fall back to conventional names
-    files = manifest.get("files", {})
-    model_uri = files.get("model") or f"{label_prefix}/model_{label_tag}.json"
-    calib_uri = files.get("calibrator") or f"{label_prefix}/isotonic_calibrator_{label_tag}.joblib"
+    files = manifest.get("files", {}) or {}
 
-    thr = manifest.get("threshold_expected")
-    threshold_source = "manifest"
-    if threshold_override is not None:
-        threshold = float(threshold_override)
-        threshold_source = "override"
-    elif thr is not None:
-        threshold = float(thr)
-    else:
-        threshold = float(fallback_threshold)
-        threshold_source = "fallback"
-
-    # Download model json to temp file and load
+    # Model bytes (UBJ) -> local cache -> load into XGBClassifier
+    model_uri = files.get("model") or f"{label_prefix}/model_{label_tag}.ubj"
     tmp_dir = Path(".local_infer_cache") / label_tag
     tmp_dir.mkdir(parents=True, exist_ok=True)
     local_model = tmp_dir / Path(model_uri).name
@@ -206,8 +198,9 @@ def _load_label_artifacts(
 
     # Optional calibrator
     calibrator: Optional[IsotonicRegression] = None
-    local_cal = tmp_dir / Path(calib_uri).name
+    calib_uri = files.get("calibrator") or f"{label_prefix}/isotonic_calibrator_{label_tag}.joblib"
     try:
+        local_cal = tmp_dir / Path(calib_uri).name
         gcs_download_file(calib_uri, local_cal)
         import joblib
 
@@ -215,15 +208,48 @@ def _load_label_artifacts(
     except Exception:
         calibrator = None
 
+    # Threshold resolution: override > manifest value > threshold file > fallback
+    threshold: Optional[float] = None
+    threshold_source = "manifest"
+    if threshold_override is not None:
+        threshold = float(threshold_override)
+        threshold_source = "override"
+    else:
+        if "threshold_expected" in manifest:
+            threshold = float(manifest["threshold_expected"])
+        else:
+            threshold_uri = files.get("threshold") or f"{label_prefix}/threshold_expected_{label_tag}.txt"
+            try:
+                local_thr = tmp_dir / Path(threshold_uri).name
+                gcs_download_file(threshold_uri, local_thr)
+                with open(local_thr, "r", encoding="utf-8") as f:
+                    threshold = float((f.read() or "0.5").strip())
+                threshold_source = "file"
+            except Exception:
+                threshold = None
+        if threshold is None:
+            threshold = float(fallback_threshold)
+            threshold_source = "fallback"
+
+    # Feature names ensure strict column ordering (optional)
+    feature_names: Optional[List[str]]
+    fn_uri = files.get("feature_names") or f"{label_prefix}/feature_names.json"
+    try:
+        loaded = gcs_download_json(fn_uri)
+        feature_names = list(loaded or [])
+    except Exception:
+        feature_names = None
+
     return LabelArtifacts(
         label=label_tag,
         model=model,
         calibrator=calibrator,
-        threshold=threshold,
+        threshold=float(threshold),
         threshold_source=threshold_source,
-        model_version_name=m.resource_name,
-        artifact_uri=artifact_uri,
-        run_id=manifest.get("run_id"),
+        model_version_name=model_version_name,
+        artifact_uri=label_prefix,
+        run_id=manifest.get("run_id") or run_id_label,
+        feature_names=feature_names,
         manifest=manifest,
     )
 
@@ -324,12 +350,13 @@ def _score_one_label(
     # Build X like training
     X = _prep_features_like_training(feats_df)
 
-    # Align to training feature order if model exposes feature names
-    try:
-        booster = label_art.model.get_booster()
-        feat_names = booster.feature_names
-    except Exception:
-        feat_names = None
+    # Align to training feature order using persisted feature_names (preferred)
+    feat_names = label_art.feature_names
+    if not feat_names:
+        try:
+            feat_names = label_art.model.get_booster().feature_names
+        except Exception:
+            feat_names = None
     X = _align_to_feature_names(X, feat_names)
 
     # Raw model proba

@@ -16,5 +16,5 @@ images:
   - $_TRAINING_IMAGE
   - $_INFERENCE_IMAGE
 substitutions:
-  _TRAINING_IMAGE: europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/training:latest
-  _INFERENCE_IMAGE: europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/inference:latest
+  _TRAINING_IMAGE: europe-west3-docker.pkg.dev/propensity-to-subscr-eng-prod/pts-model/training:latest
+  _INFERENCE_IMAGE: europe-west3-docker.pkg.dev/propensity-to-subscr-eng-prod/pts-model/inference:latest

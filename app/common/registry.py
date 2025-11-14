@@ -107,6 +107,39 @@ def resolve_latest_version(display_name: str) -> Optional[aiplatform.Model]:
     return models[0]
 
 
+def resolve_production_version_for_label(display_name: str, label_tag: str) -> Optional[aiplatform.Model]:
+    """
+    Return the model version for a specific label, preferring alias
+    'production-{label_tag}', then global 'production'. If neither exists,
+    return the most-recent version for that label. Returns None if no
+    versions exist for this label.
+    """
+    models = list(aiplatform.Model.list(filter=f'display_name="{display_name}"'))
+    if not models:
+        return None
+
+    def _labels(model: aiplatform.Model) -> Dict[str, str]:
+        return dict(getattr(model, "labels", {}) or {})
+
+    candidates = [m for m in models if _labels(m).get("label") == label_tag]
+    if not candidates:
+        return None
+
+    wanted_alias = f"production-{label_tag}".lower()
+    for model in candidates:
+        aliases = set(alias.lower() for alias in (model.version_aliases or []))
+        if wanted_alias in aliases:
+            return model
+
+    for model in candidates:
+        aliases = set(alias.lower() for alias in (model.version_aliases or []))
+        if "production" in aliases:
+            return model
+
+    candidates.sort(key=lambda m: m.gca_resource.create_time, reverse=True)
+    return candidates[0]
+
+
 # ---------------------------------------------------------------------
 # Aliases (promotion/demotion)
 # ---------------------------------------------------------------------
