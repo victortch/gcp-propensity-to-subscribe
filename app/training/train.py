@@ -1202,8 +1202,11 @@ def run_training(
                     best_params=summary.best_params,
                     threshold=summary.threshold_expected,
                 )
-            except Exception as e:
-                logger.warning("artifact_io.write_manifest_and_register_existing failed: %s", e)
+            except Exception:
+                logger.exception(
+                    "Failed to register training artifacts with Vertex AI Model Registry"
+                )
+                raise
     
         # Persist metrics to BigQuery
         if metrics_to_bq is not None:
