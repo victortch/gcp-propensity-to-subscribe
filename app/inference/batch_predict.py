@@ -17,14 +17,11 @@ This module does not alter training logic or data processing semantics.
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.isotonic import IsotonicRegression
@@ -35,6 +32,7 @@ from app.common.io import (
     get_bq_client,
     gcs_download_json,
     gcs_download_file,
+    gcs_upload_json,
     load_env_config,
 )
 from app.common.registry import (
@@ -42,27 +40,22 @@ from app.common.registry import (
     resolve_production_version,
     get_artifact_uri,
 )
+from app.common.preprocessing import drop_meta_cols
 from app.common.utils import get_logger
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
 
 # ---------------------------------------------------------------------
 # Small helpers (match training feature prep without labels)
 # ---------------------------------------------------------------------
 
-NON_FEATURE_COLS_BASE = {"user_id", "date", "split", "fold", "label", "run_id"}
-
 def _prep_features_like_training(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Mirrors training's prepare_xy_compat(), minus target handling:
-      - Drop id/meta + anything ending with '_id' and all y_* columns
-      - Numeric -> float32
-      - Non-numeric -> categorical codes -> float32
-      - Fill NaNs with 0.0
-    """
-    dyn_ids = {c for c in df.columns if c.lower().endswith("_id")}
-    drop_cols = set(NON_FEATURE_COLS_BASE) | dyn_ids | {c for c in df.columns if c.startswith("y_")}
-    feat_cols = [c for c in df.columns if c not in drop_cols]
-    X = df[feat_cols].copy()
+    """Apply the same casting/coding rules as training's prepare_xy_compat."""
+    X = drop_meta_cols(df)
     for c in X.columns:
         if pd.api.types.is_numeric_dtype(X[c]):
             X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
@@ -95,11 +88,41 @@ class LabelArtifacts:
     model: xgb.XGBClassifier
     calibrator: Optional[IsotonicRegression]
     threshold: float
+    threshold_source: str
     model_version_name: str
     artifact_uri: str
+    run_id: Optional[str]
+    manifest: Dict[str, Any]
 
 
-def _load_label_artifacts(display_name: str, label_tag: str) -> LabelArtifacts:
+def _parse_thresholds_policy(path: str) -> Tuple[float, Dict[str, float]]:
+    """Return fallback threshold and per-label overrides."""
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to read thresholds_policy.yaml")
+
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    default_cfg = cfg.get("default", {})
+    fallback = float(default_cfg.get("fallback_threshold", 0.5))
+
+    overrides: Dict[str, float] = {}
+    for label, body in (cfg.get("labels") or {}).items():
+        override = (body or {}).get("override") or {}
+        fixed = override.get("fixed_threshold")
+        if fixed is not None:
+            overrides[label] = float(fixed)
+
+    return fallback, overrides
+
+
+def _load_label_artifacts(
+    display_name: str,
+    label_tag: str,
+    *,
+    threshold_override: Optional[float],
+    fallback_threshold: float,
+) -> LabelArtifacts:
     """
     Resolve production version, read its manifest.json, load model json,
     optional isotonic calibrator, and threshold value.
@@ -131,31 +154,34 @@ def _load_label_artifacts(display_name: str, label_tag: str) -> LabelArtifacts:
     files = manifest.get("files", {})
     model_uri = files.get("model") or f"{label_prefix}/model_{label_tag}.json"
     calib_uri = files.get("calibrator") or f"{label_prefix}/isotonic_calibrator_{label_tag}.joblib"
-    thr = manifest.get("threshold_expected", None)
-    if thr is None:
-        # final fallback if manifest lacked it
-        thr = 0.5
-    threshold = float(thr)
+
+    thr = manifest.get("threshold_expected")
+    threshold_source = "manifest"
+    if threshold_override is not None:
+        threshold = float(threshold_override)
+        threshold_source = "override"
+    elif thr is not None:
+        threshold = float(thr)
+    else:
+        threshold = float(fallback_threshold)
+        threshold_source = "fallback"
 
     # Download model json to temp file and load
     tmp_dir = Path(".local_infer_cache") / label_tag
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    local_model = tmp_dir / f"model_{label_tag}.json"
+    local_model = tmp_dir / Path(model_uri).name
     gcs_download_file(model_uri, local_model)
     model = xgb.XGBClassifier()
     model.load_model(str(local_model))
 
     # Optional calibrator
     calibrator: Optional[IsotonicRegression] = None
+    local_cal = tmp_dir / Path(calib_uri).name
     try:
-        from google.cloud.storage import Blob  # ensure client exists
-        local_cal = tmp_dir / f"isotonic_calibrator_{label_tag}.joblib"
-        try:
-            gcs_download_file(calib_uri, local_cal)
-            import joblib
-            calibrator = joblib.load(local_cal)
-        except Exception:
-            calibrator = None
+        gcs_download_file(calib_uri, local_cal)
+        import joblib
+
+        calibrator = joblib.load(local_cal)
     except Exception:
         calibrator = None
 
@@ -164,8 +190,11 @@ def _load_label_artifacts(display_name: str, label_tag: str) -> LabelArtifacts:
         model=model,
         calibrator=calibrator,
         threshold=threshold,
+        threshold_source=threshold_source,
         model_version_name=m.resource_name,
         artifact_uri=artifact_uri,
+        run_id=manifest.get("run_id"),
+        manifest=manifest,
     )
 
 
@@ -212,6 +241,39 @@ def _write_predictions(
     job.result()
 
 
+def _write_inference_metadata(
+    *,
+    gcs_model_bucket: str,
+    scoring_date: str,
+    artifacts: Dict[str, LabelArtifacts],
+    rows_written: int,
+    status: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Persist a JSON sidecar summarizing the inference run."""
+    now = datetime.utcnow()
+    created_at = now.isoformat(timespec="seconds") + "Z"
+    payload = {
+        "scoring_date": scoring_date,
+        "created_at": created_at,
+        "status": status,
+        "rows_written": int(rows_written),
+        "labels": {},
+    }
+    for tag, art in artifacts.items():
+        payload["labels"][tag] = {
+            "model_version": art.model_version_name,
+            "artifact_uri": art.artifact_uri,
+            "threshold": float(art.threshold),
+            "threshold_source": art.threshold_source,
+            "run_id": art.run_id,
+        }
+
+    slug = now.strftime("%Y%m%dT%H%M%SZ")
+    uri = f"{gcs_model_bucket.rstrip('/')}/inference_runs/{scoring_date}/{slug}.json"
+    gcs_upload_json(uri, payload, indent=2)
+    return uri, payload
+
+
 # ---------------------------------------------------------------------
 # Inference per label
 # ---------------------------------------------------------------------
@@ -253,8 +315,10 @@ def _score_one_label(
     out["label"] = label_art.label
     out["prob"] = prob.astype("float64")
     out["decision"] = decision
+    out["threshold"] = float(label_art.threshold)
     out["model_version"] = label_art.model_version_name
     out["artifact_uri"] = label_art.artifact_uri
+    out["model_run_id"] = label_art.run_id
     out["created_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     return out
 
@@ -287,18 +351,29 @@ def run_inference(
     """
     logger = get_logger("pts.inference.batch_predict")
 
+    if not gcs_model_bucket:
+        raise ValueError("gcs_model_bucket must be provided")
+
     # 1) Labels
     with open(labels_yaml, "r", encoding="utf-8") as f:
-        import yaml
+        if yaml is None:
+            raise RuntimeError("PyYAML is required to read labels.yaml")
         labels_cfg = yaml.safe_load(f) or {}
     labels = [l["id"] for l in labels_cfg.get("labels", []) if l.get("enabled", True)]
     if not labels:
         raise RuntimeError("No enabled labels found in labels.yaml")
 
+    fallback_threshold, threshold_overrides = _parse_thresholds_policy(thresholds_policy)
+
     # 2) Resolve production model & per-label artifacts
     arts: Dict[str, LabelArtifacts] = {}
     for tag in labels:
-        arts[tag] = _load_label_artifacts(vertex_model_display_name, tag)
+        arts[tag] = _load_label_artifacts(
+            vertex_model_display_name,
+            tag,
+            threshold_override=threshold_overrides.get(tag),
+            fallback_threshold=fallback_threshold,
+        )
 
     # 3) Read features
     client = get_bq_client(project_id, region)
@@ -311,7 +386,20 @@ def run_inference(
     )
     if feats.empty:
         logger.warning("No feature rows found for scoring_date=%s; writing nothing.", scoring_date)
-        return {"status": "no_features", "scoring_date": scoring_date}
+        metadata_uri, _ = _write_inference_metadata(
+            gcs_model_bucket=gcs_model_bucket,
+            scoring_date=scoring_date,
+            artifacts=arts,
+            rows_written=0,
+            status="no_features",
+        )
+        return {
+            "status": "no_features",
+            "scoring_date": scoring_date,
+            "labels_scored": labels,
+            "rows_written": 0,
+            "metadata_uri": metadata_uri,
+        }
 
     # Keep user/date for output; accept either 'scoring_date' or 'date' in features
     date_col = "scoring_date" if "scoring_date" in feats.columns else "date"
@@ -338,6 +426,9 @@ def run_inference(
     pred_df["user_id"] = pd.to_numeric(pred_df["user_id"], errors="coerce").astype("Int64")
     pred_df["decision"] = pred_df["decision"].astype("Int64")
     pred_df["scoring_date"] = pd.to_datetime(pred_df["scoring_date"]).dt.date
+    pred_df["threshold"] = pd.to_numeric(pred_df["threshold"], errors="coerce").astype("float64")
+    pred_df["model_run_id"] = pred_df["model_run_id"].astype("string")
+    pred_df["model_run_id"] = pred_df["model_run_id"].replace({pd.NA: None})
 
     # 5) Write to BigQuery
     _write_predictions(
@@ -347,8 +438,16 @@ def run_inference(
         table=predictions_table,
         df=pred_df[[
             "scoring_date", "user_id", "label", "prob", "decision",
-            "model_version", "artifact_uri", "created_at"
+            "threshold", "model_version", "artifact_uri", "model_run_id", "created_at"
         ]],
+    )
+
+    metadata_uri, metadata_payload = _write_inference_metadata(
+        gcs_model_bucket=gcs_model_bucket,
+        scoring_date=scoring_date,
+        artifacts=arts,
+        rows_written=len(pred_df),
+        status="ok",
     )
 
     return {
@@ -356,4 +455,6 @@ def run_inference(
         "scoring_date": scoring_date,
         "labels_scored": labels,
         "rows_written": int(len(pred_df)),
+        "metadata_uri": metadata_uri,
+        "metadata": metadata_payload,
     }

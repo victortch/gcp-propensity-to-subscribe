@@ -4,7 +4,9 @@
   {"name": "label", "type": "STRING", "mode": "REQUIRED"},
   {"name": "prob", "type": "FLOAT", "mode": "REQUIRED"},
   {"name": "decision", "type": "INT64", "mode": "REQUIRED"},
+  {"name": "threshold", "type": "FLOAT", "mode": "NULLABLE"},
   {"name": "model_version", "type": "STRING", "mode": "NULLABLE"},
   {"name": "artifact_uri", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "model_run_id", "type": "STRING", "mode": "NULLABLE"},
   {"name": "created_at", "type": "TIMESTAMP", "mode": "NULLABLE"}
 ]
