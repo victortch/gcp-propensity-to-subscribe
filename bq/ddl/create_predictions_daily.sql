@@ -10,8 +10,10 @@ CREATE TABLE IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe.pr
   label         STRING   NOT NULL,  -- e.g. cap_30d
   prob          FLOAT64  NOT NULL,  -- calibrated probability
   decision      INT64    NOT NULL,  -- 0/1 via selected threshold
+  threshold     FLOAT64,            -- threshold applied for decision
   model_version STRING,             -- Vertex AI model resource name
   artifact_uri  STRING,             -- GCS folder with artifacts
+  model_run_id  STRING,             -- training run_id for the artifacts
   created_at    TIMESTAMP           -- ingestion timestamp (UTC)
 )
 PARTITION BY scoring_date

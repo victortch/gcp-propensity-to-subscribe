@@ -20,8 +20,10 @@ PREDICTIONS_DAILY_SCHEMA: List[bigquery.SchemaField] = [
     bigquery.SchemaField("label", "STRING", mode="REQUIRED"),        # e.g., cap_30d
     bigquery.SchemaField("prob", "FLOAT", mode="REQUIRED"),          # calibrated probability
     bigquery.SchemaField("decision", "INT64", mode="REQUIRED"),      # 0/1 using selected threshold
+    bigquery.SchemaField("threshold", "FLOAT", mode="NULLABLE"),      # threshold applied for decision
     bigquery.SchemaField("model_version", "STRING", mode="NULLABLE"),# Vertex AI model resource name
     bigquery.SchemaField("artifact_uri", "STRING", mode="NULLABLE"), # GCS folder with artifacts
+    bigquery.SchemaField("model_run_id", "STRING", mode="NULLABLE"),  # training run that produced artifacts
     bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),# ingestion timestamp (UTC ISO)
 ]
 
