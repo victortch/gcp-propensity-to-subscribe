@@ -1,9 +1,9 @@
 -- Creates predictions table if it does not exist.
--- Dataset defaults to propensity_to_subscribe in project economedia-data-prod-laoy.
+-- Dataset defaults to propensity_to_subscribe in project propensity-to-subscr-eng-prod.
 
-CREATE SCHEMA IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe`;
+CREATE SCHEMA IF NOT EXISTS `propensity-to-subscr-eng-prod.propensity_to_subscribe`;
 
-CREATE TABLE IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe.predictions_daily`
+CREATE TABLE IF NOT EXISTS `propensity-to-subscr-eng-prod.propensity_to_subscribe.predictions_daily`
 (
   scoring_date  DATE     NOT NULL,  -- partition column
   user_id       INT64    NOT NULL,

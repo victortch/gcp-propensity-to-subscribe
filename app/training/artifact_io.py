@@ -196,6 +196,7 @@ def write_manifest_and_register_existing(
         "calibrator": _gcs_join(gcs_prefix, f"isotonic_calibrator_{label_tag}.joblib"),
         "best_params": _gcs_join(gcs_prefix, "best_params.json"),
         "threshold": _gcs_join(gcs_prefix, f"threshold_expected_{label_tag}.txt"),
+        "feature_names": _gcs_join(gcs_prefix, "feature_names.json"),
     }
 
     manifest: Dict[str, object] = {
@@ -226,14 +227,19 @@ def write_manifest_and_register_existing(
     if "best_params" in manifest:
         metadata["best_params_json"] = json.dumps(manifest["best_params"], separators=(",", ":"))
 
-    # Register with both a generic alias and a run-specific alias for easy pinning.
+    # Register with both a generic alias, a run-specific alias, and a label-specific production alias.
     run_id_label = sanitize_for_bq_label(run_id)
+    run_label_alias = sanitize_for_bq_label(f"{run_id}_{label_tag}")
     model = register_model_version(
         display_name=vertex_model_display_name,
         artifact_uri=gcs_prefix,
         labels=labels,
         metadata=metadata,
-        version_aliases=["candidate", run_id_label],  # add a unique alias for this exact version
+        version_aliases=[
+            "candidate",
+            run_label_alias,
+            f"production-{label_tag}",
+        ],  # add unique + label-specific production aliases
     )
 
 

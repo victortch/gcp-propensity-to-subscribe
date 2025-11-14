@@ -597,7 +597,9 @@ class LabelTrainer:
         booster = self.model.get_booster()
         model_bytes = booster.save_raw()  # binary (UBJ)
         gcs_upload_bytes(f"{self.gcs_prefix}/model_{self.label_tag}.ubj", model_bytes, content_type="application/octet-stream")
-        
+
+        # Persist feature order for strict inference parity
+        gcs_upload_json(f"{self.gcs_prefix}/feature_names.json", list(X_all.columns))
 
 
         # Validation concat for calibration & threshold selection

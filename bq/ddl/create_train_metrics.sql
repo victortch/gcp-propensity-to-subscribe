@@ -1,9 +1,9 @@
 -- BigQuery DDL for training metrics tables.
 -- Assumes dataset `propensity_to_subscribe` already exists.
 
-CREATE SCHEMA IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe`;
+CREATE SCHEMA IF NOT EXISTS `propensity-to-subscr-eng-prod.propensity_to_subscribe`;
 
-CREATE TABLE IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe.train_metrics`
+CREATE TABLE IF NOT EXISTS `propensity-to-subscr-eng-prod.propensity_to_subscribe.train_metrics`
 (
   run_id             STRING    NOT NULL,
   label_tag          STRING    NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe.tr
 PARTITION BY DATE(created_at)
 CLUSTER BY label_tag;
 
-CREATE TABLE IF NOT EXISTS `economedia-data-prod-laoy.propensity_to_subscribe.train_metrics_detail`
+CREATE TABLE IF NOT EXISTS `propensity-to-subscr-eng-prod.propensity_to_subscribe.train_metrics_detail`
 (
   run_id                     STRING    NOT NULL,
   label                      STRING    NOT NULL,

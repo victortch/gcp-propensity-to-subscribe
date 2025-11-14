@@ -25,7 +25,7 @@ main:
           # Core infra defaults
           - project: ${project_id or "propensity-to-subscr-eng-prod"}
           - location: ${region or "europe-west3"}
-          - image: ${training_image or "europe-west3-docker.pkg.dev/propensity-to-subscr-eng-prod/pts_model/training:latest"}
+          - image: ${training_image or "europe-west3-docker.pkg.dev/propensity-to-subscr-eng-prod/pts-model/training:latest"}
           - machine: ${machine_type or "e2-standard-4"}
           - sa: ${service_account or "sa-ml-train@propensity-to-subscr-eng-prod.iam.gserviceaccount.com"}
 
