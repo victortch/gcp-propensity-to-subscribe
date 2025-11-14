@@ -255,8 +255,18 @@ def promote_to_production(
 
 def get_artifact_uri(model: aiplatform.Model) -> Optional[str]:
     """Return the artifact URI (GCS path) recorded with the model version."""
-    # aiplatform.Model exposes underlying gca_resource fields
-    return getattr(model, "artifact_uri", None)
+    # ``Model`` exposes the field directly for some SDK versions, but on others the
+    # attribute only lives on the underlying GAPIC resource. Fall back accordingly so
+    # we always surface the URI recorded during ``Model.upload``.
+    uri = getattr(model, "artifact_uri", None)
+    if uri:
+        return uri
+
+    gca = getattr(model, "gca_resource", None)
+    if gca is not None:
+        uri = getattr(gca, "artifact_uri", None) or getattr(gca, "artifactUri", None)
+
+    return uri
 
 
 def get_labels(model: aiplatform.Model) -> Dict[str, str]:
