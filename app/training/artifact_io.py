@@ -156,3 +156,89 @@ def save_and_register_label_run(
         "artifact_uri": gcs_prefix,
         "model_resource_name": model.resource_name,
     }
+
+
+def write_manifest_and_register_existing(
+    *,
+    label_tag: str,
+    run_id: str,
+    gcs_model_bucket: str,
+    vertex_model_display_name: str,
+    vertex_model_registry_label: str,
+    best_params: Optional[dict],
+    threshold: Optional[float],
+) -> Dict[str, str]:
+    """
+    Write a manifest.json (no local files needed) and register a version in Vertex AI.
+
+    Assumes artifacts already exist under:
+      gs://<bucket>/runs/<run_id>/<label_tag>/
+      - model_<label>.ubj
+      - isotonic_calibrator_<label>.joblib
+      - best_params.json
+      - threshold_expected_<label>.txt
+      - plots and CSVs (optional)
+
+    Returns:
+      {"artifact_uri": <prefix>, "model_resource_name": <vertex model name>}
+    """
+    cfg = load_env_config()
+    project_id = cfg.get("project_id")
+    region = cfg.get("region")
+
+    # Initialize Vertex AI SDK
+    init_ai(project_id, region)
+
+    gcs_prefix = f"{gcs_model_bucket.rstrip('/')}/runs/{run_id}/{label_tag}"
+
+    files = {
+        "model": _gcs_join(gcs_prefix, f"model_{label_tag}.ubj"),
+        "calibrator": _gcs_join(gcs_prefix, f"isotonic_calibrator_{label_tag}.joblib"),
+        "best_params": _gcs_join(gcs_prefix, "best_params.json"),
+        "threshold": _gcs_join(gcs_prefix, f"threshold_expected_{label_tag}.txt"),
+    }
+
+    manifest: Dict[str, object] = {
+        "run_id": run_id,
+        "label": label_tag,
+        "files": files,
+        "display_name": vertex_model_display_name,
+        "registry_group": vertex_model_registry_label,
+    }
+    if best_params is not None:
+        manifest["best_params"] = best_params
+    if threshold is not None:
+        manifest["threshold_expected"] = float(threshold)
+
+    manifest_uri = _gcs_join(gcs_prefix, "manifest.json")
+    gcs_upload_json(manifest_uri, manifest, indent=2)
+
+    run_id_label = sanitize_for_bq_label(run_id)
+    labels = {
+        "stage": "candidate",
+        "run_id": run_id_label,
+        "label": label_tag,
+        "group": vertex_model_registry_label,
+    }
+    metadata = {}
+    if "threshold_expected" in manifest:
+        metadata["threshold_expected"] = str(manifest["threshold_expected"])
+    if "best_params" in manifest:
+        metadata["best_params_json"] = json.dumps(manifest["best_params"], separators=(",", ":"))
+
+    # Register with both a generic alias and a run-specific alias for easy pinning.
+    run_id_label = sanitize_for_bq_label(run_id)
+    model = register_model_version(
+        display_name=vertex_model_display_name,
+        artifact_uri=gcs_prefix,
+        labels=labels,
+        metadata=metadata,
+        version_aliases=["candidate", run_id_label],  # add a unique alias for this exact version
+    )
+
+
+    return {
+        "artifact_uri": gcs_prefix,
+        "model_resource_name": model.resource_name,
+    }
+

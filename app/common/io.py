@@ -36,7 +36,7 @@ except Exception:
 # Config
 # =========================
 
-_DEF_PROJECT = "economedia-data-prod-laoy"
+_DEF_PROJECT = "propensity-to-subscr-eng-prod"
 _DEF_LOCATION = "europe-west3"
 
 _ENV_PATH = Path("configs/env.yaml")               # local (not committed)
@@ -86,7 +86,7 @@ def load_env_config() -> Dict[str, Any]:
 
 
 # =========================
-# GCS helpers
+# GCS helpers (consolidated)
 # =========================
 
 def gcs_parse_uri(uri: str) -> tuple[str, str]:
@@ -96,65 +96,51 @@ def gcs_parse_uri(uri: str) -> tuple[str, str]:
     parts = no_scheme.split("/", 1)
     bucket = parts[0]
     blob = parts[1] if len(parts) > 1 else ""
+    if not bucket or not blob:
+        raise ValueError(f"Invalid GCS URI: {uri}")
     return bucket, blob
 
-
 def _get_storage_client() -> storage.Client:
-    # ADC: works in Vertex AI and locally if you ran `gcloud auth application-default login`
+    # ADC works in Vertex AI and locally (after `gcloud auth application-default login`)
     return storage.Client(project=os.getenv("PROJECT_ID", _DEF_PROJECT))
-
 
 def gcs_download_bytes(uri: str) -> bytes:
     bucket_name, blob_name = gcs_parse_uri(uri)
     client = _get_storage_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    return blob.download_as_bytes()
-
+    return client.bucket(bucket_name).blob(blob_name).download_as_bytes()
 
 def gcs_upload_bytes(uri: str, data: bytes, content_type: Optional[str] = None) -> None:
     bucket_name, blob_name = gcs_parse_uri(uri)
     client = _get_storage_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
+    blob = client.bucket(bucket_name).blob(blob_name)
     blob.upload_from_file(io.BytesIO(data), rewind=True, content_type=content_type)
 
+def gcs_upload_text(uri: str, text: str, content_type: str = "text/plain") -> None:
+    gcs_upload_bytes(uri, text.encode("utf-8"), content_type=content_type)
 
 def gcs_download_json(uri: str) -> Any:
-    data = gcs_download_bytes(uri)
-    return json.loads(data.decode("utf-8"))
-
+    return json.loads(gcs_download_bytes(uri).decode("utf-8"))
 
 def gcs_upload_json(uri: str, obj: Any, indent: int = 2) -> None:
-    data = json.dumps(obj, indent=indent).encode("utf-8")
-    gcs_upload_bytes(uri, data, content_type="application/json")
-
+    gcs_upload_bytes(uri, json.dumps(obj, indent=indent).encode("utf-8"), content_type="application/json")
 
 def gcs_download_file(uri: str, local_path: str | Path) -> None:
     bucket_name, blob_name = gcs_parse_uri(uri)
     client = _get_storage_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    blob.download_to_filename(str(local_path))
-
+    client.bucket(bucket_name).blob(blob_name).download_to_filename(str(local_path))
 
 def gcs_upload_file(uri: str, local_path: str | Path, content_type: Optional[str] = None) -> None:
     bucket_name, blob_name = gcs_parse_uri(uri)
     client = _get_storage_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(str(local_path), content_type=content_type)
-
+    client.bucket(bucket_name).blob(blob_name).upload_from_filename(str(local_path), content_type=content_type)
 
 def gcs_upload_pickle(uri: str, obj: Any) -> None:
-    buf = pickle.dumps(obj)
-    gcs_upload_bytes(uri, buf, content_type="application/octet-stream")
-
+    gcs_upload_bytes(uri, pickle.dumps(obj), content_type="application/octet-stream")
 
 def gcs_download_pickle(uri: str) -> Any:
-    buf = gcs_download_bytes(uri)
-    return pickle.loads(buf)
+    return pickle.loads(gcs_download_bytes(uri))
+
 
 
 # =========================
@@ -230,4 +216,3 @@ def bq_load_dataframe(df: pd.DataFrame,
 
     job = client.load_table_from_dataframe(df, table_fqn, job_config=job_cfg)
     return job
-

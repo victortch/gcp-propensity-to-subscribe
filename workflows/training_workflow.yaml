@@ -1,6 +1,6 @@
 # Cloud Workflow: quarterly training job orchestration for Economedia PTS.
 # Launches a Vertex AI Custom Job running the training container with
-# explicit window parameters.
+# explicit window parameters and env-based configuration.
 
 main:
   params: [
@@ -13,23 +13,40 @@ main:
     primary_label,
     training_image,
     machine_type,
-    service_account
+    service_account,
+    bq_dataset,
+    gcs_model_bucket,  
+    vertex_model_display_name,
+    vertex_model_registry_label
   ]
   steps:
     - defaults:
         assign:
-          - project: ${project_id or "economedia-data-prod-laoy"}
+          # Core infra defaults
+          - project: ${project_id or "propensity-to-subscr-eng-prod"}
           - location: ${region or "europe-west3"}
-          - image: ${training_image or "europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/training:latest"}
+          - image: ${training_image or "europe-west3-docker.pkg.dev/propensity-to-subscr-eng-prod/pts_model/training:latest"}
           - machine: ${machine_type or "e2-standard-4"}
-          - sa: ${service_account or "sa-ml-train@economedia-data-prod-laoy.iam.gserviceaccount.com"}
-          - run_id: ${sys.uuid()}
+          - sa: ${service_account or "sa-ml-train@propensity-to-subscr-eng-prod.iam.gserviceaccount.com"}
+
+          # App/config defaults (what your code expects via load_env_config)
+          - dataset: ${bq_dataset or "propensity_to_subscribe"}
+          - model_bucket: ${gcs_model_bucket or "gs://economedia-pts-models"}
+          - model_display: ${vertex_model_display_name or "pts_xgb_model"}
+          - registry_label: ${vertex_model_registry_label or "propensity_to_subscribe"}
+
+          # Traceable, time-sortable run id (matches your code's default format)
+          - run_id: ${time.format(sys.now(), "%Y%m%dT%H%M%SZ")}
+
+          # Window resolution (your original logic)
           - now: ${sys.now()}
           - resolved_freeze: ${freeze_date or time.format(time.add(now, duration("-P7D")), "%Y-%m-%d")}
           - freeze_ts: ${time.parse(resolved_freeze + "T00:00:00Z")}
           - resolved_start: ${start_date or time.format(time.add(freeze_ts, duration("-P180D")), "%Y-%m-%d")}
           - resolved_dne_start: ${dne_start or resolved_start}
           - resolved_cap_start: ${cap_wall1_offer_start or resolved_start}
+
+          # Container args (entrypoint parses these)
           - base_args: [
               "--start_date", ${resolved_start},
               "--freeze_date", ${resolved_freeze},
@@ -37,6 +54,7 @@ main:
               "--cap_wall1_offer_start", ${resolved_cap_start}
             ]
           - args: ${primary_label ? base_args + ["--primary_label", primary_label] : base_args}
+
     - launch_training:
         call: googleapis.aiplatform.v1.projects.locations.customJobs.create
         args:
@@ -52,16 +70,35 @@ main:
                   containerSpec:
                     imageUri: ${image}
                     args: ${args}
+                    env:
+                      # Environment variables your code reads via load_env_config()
+                      - name: PROJECT_ID
+                        value: ${project}
+                      - name: REGION
+                        value: ${location}
+                      - name: BQ_DATASET
+                        value: ${dataset}
+                      - name: GCS_MODEL_BUCKET
+                        value: ${model_bucket}
+                      - name: VERTEX_MODEL_DISPLAY_NAME
+                        value: ${model_display}
+                      - name: VERTEX_MODEL_REGISTRY_LABEL
+                        value: ${registry_label}
+                      - name: RUN_ID
+                        value: ${run_id}
         result: training_job
+
     - wait_initial:
         call: sys.sleep
         args:
           seconds: 30
+
     - poll_status:
         call: googleapis.aiplatform.v1.projects.locations.customJobs.get
         args:
           name: ${training_job.name}
         result: job_state
+
     - check_status:
         switch:
           - condition: ${job_state.state == "JOB_STATE_SUCCEEDED"}
@@ -73,6 +110,7 @@ main:
             raise: ${"Training job ended with state " + job_state.state}
           - default:
               next: wait_loop
+
     - wait_loop:
         call: sys.sleep
         args:

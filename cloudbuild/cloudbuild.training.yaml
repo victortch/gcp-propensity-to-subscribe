@@ -9,4 +9,4 @@ steps:
 images:
   - $_IMAGE_URI
 substitutions:
-  _IMAGE_URI: europe-west3-docker.pkg.dev/economedia-data-prod-laoy/pts_model/training:latest
+  _IMAGE_URI: europe-west3-docker.pkg.dev/propensity-to-subscr-eng-prod/pts-model/training:latest

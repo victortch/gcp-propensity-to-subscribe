@@ -2,7 +2,7 @@
 Model training for Economedia PTS.
 
 Key behaviors preserved:
-- Latest run_id from cv_build_metadata.
+- Run_id provided by entrypoint; unified across cv_build and training.
 - One model per label (cap_90d, dne_90d, cap_30d, dne_30d).
 - Feature prep.
 - Bayesian Optimization over XGBoost hyperparameters (maximize mean ROC AUC across folds).
@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
@@ -44,7 +43,8 @@ from sklearn.metrics import (
 
 from google.cloud import bigquery
 
-from app.common.io import get_bq_client
+from app.common.io import get_bq_client, gcs_upload_bytes, gcs_upload_text, gcs_upload_json
+import io
 from app.common.preprocessing import prepare_xy_compat
 from app.common.utils import get_logger
 
@@ -63,33 +63,22 @@ except Exception:  # pragma: no cover
 # -----------------------
 # Defaults from env (overridden by entrypoint params)
 # -----------------------
-PROJECT_ID = os.getenv("PROJECT_ID", "economedia-data-prod-laoy")
+PROJECT_ID = os.getenv("PROJECT_ID", "propensity-to-subscr-eng-prod")
 BQ_LOCATION = os.getenv("BQ_LOCATION", "europe-west3")
 BQ_DATASET = os.getenv("BQ_DATASET", "propensity_to_subscribe")
 
 TABLE_DATA = f"{PROJECT_ID}.{BQ_DATASET}.train_data"
 TABLE_META = f"{PROJECT_ID}.{BQ_DATASET}.cv_build_metadata"
+TABLE_PREP = f"{PROJECT_ID}.{BQ_DATASET}.prep_metadata"
 
 RANDOM_STATE = 42
-N_BAYES_INIT = 8
-N_BAYES_ITER = 24
+N_BAYES_INIT = 5
+N_BAYES_ITER = 55
 
 
 # -----------------------
 # Helpers reading from BQ
 # -----------------------
-
-def latest_run_id(client: bigquery.Client) -> str:
-    sql = f"""
-    SELECT run_id
-    FROM `{TABLE_META}`
-    ORDER BY run_started_at DESC
-    LIMIT 1
-    """
-    df = client.query(sql).result().to_dataframe()
-    if df.empty:
-        raise RuntimeError("No run_id found in cv_build_metadata.")
-    return str(df.iloc[0]["run_id"])
 
 
 def load_train_table(client: bigquery.Client, run_id: str, label_tag: str) -> pd.DataFrame:
@@ -143,6 +132,12 @@ def class_weights_from_counts(y_true: np.ndarray | pd.Series, pos_true: int, neg
     w_neg = neg_true / neg_obs
     return np.where(arr == 1, w_pos, w_neg).astype("float64")
 
+
+def _clip01(a: np.ndarray) -> np.ndarray:
+    """Ensure probability array is finite and in [0, 1]."""
+    a = np.asarray(a, dtype=float)
+    a = np.nan_to_num(a, nan=0.5, posinf=1.0, neginf=0.0)
+    return np.clip(a, 0.0, 1.0)
 
 def best_expected_f1_threshold_global(
     y_true: np.ndarray,
@@ -276,8 +271,17 @@ def random_baseline_expected_metrics(rate_pred: float, pos_true: int, neg_true: 
         "f1": float(f1),
     }
 
+def _fig_to_png_bytes() -> bytes:
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    plt.close()
+    buf.seek(0)
+    return buf.getvalue()
 
-def plot_roc(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_path: Path):
+
+
+def plot_roc(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_gcs_uri: str):
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     pred = (y_prob >= thr).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
@@ -292,12 +296,15 @@ def plot_roc(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_path: Path)
     plt.ylabel("True Positive Rate")
     plt.title("ROC Curve (test)")
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
-def plot_pr(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_path: Path):
+
+
+
+
+def plot_pr(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_gcs_uri: str):
     prec, rec, _ = precision_recall_curve(y_true, y_prob)
     prevalence = float(np.mean(y_true)) if len(y_true) else 0.0
     pred = (y_prob >= thr).astype(int)
@@ -313,12 +320,11 @@ def plot_pr(y_true: np.ndarray, y_prob: np.ndarray, thr: float, out_path: Path):
     plt.ylabel("Precision")
     plt.title("Precision–Recall Curve (test)")
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
-def plot_calibration(calib_df: pd.DataFrame, mean_pred_col: str, rate_col: str, out_path: Path, title: str):
+def plot_calibration(calib_df: pd.DataFrame, mean_pred_col: str, rate_col: str, out_gcs_uri: str, title: str):
     plt.figure()
     x = calib_df[mean_pred_col].values
     y = calib_df[rate_col].values
@@ -328,12 +334,11 @@ def plot_calibration(calib_df: pd.DataFrame, mean_pred_col: str, rate_col: str, 
     plt.ylabel("Observed rate")
     plt.title(title)
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
-def plot_lift(tbl: pd.DataFrame, x_col: str, y_col: str, out_path: Path, title: str):
+def plot_lift(tbl: pd.DataFrame, x_col: str, y_col: str, out_gcs_uri: str, title: str):
     plt.figure()
     plt.plot(tbl[x_col], tbl[y_col], marker="o", label="Model")
     plt.hlines(1.0, tbl[x_col].min(), tbl[x_col].max(), linestyles="--", label="Baseline")
@@ -341,9 +346,8 @@ def plot_lift(tbl: pd.DataFrame, x_col: str, y_col: str, out_path: Path, title: 
     plt.ylabel("Lift")
     plt.title(title)
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
 def _annotate_cm(ax, cm: np.ndarray):
@@ -360,19 +364,18 @@ def _annotate_cm(ax, cm: np.ndarray):
     ax.set_yticklabels(["True 0", "True 1"])
 
 
-def plot_confusions_side_by_side(cm_left: np.ndarray, cm_right: np.ndarray, titles: Tuple[str, str], out_path: Path, suptitle: str):
+def plot_confusions_side_by_side(cm_left: np.ndarray, cm_right: np.ndarray, titles: Tuple[str, str], out_gcs_uri: str, suptitle: str):
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
     _annotate_cm(axes[0], cm_left)
     axes[0].set_title(titles[0])
     _annotate_cm(axes[1], cm_right)
     axes[1].set_title(titles[1])
     fig.suptitle(suptitle)
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
-def plot_score_hist(y_true: np.ndarray, y_prob: np.ndarray, out_path: Path, bins: int = 40):
+def plot_score_hist(y_true: np.ndarray, y_prob: np.ndarray, out_gcs_uri: str, bins: int = 40):
     plt.figure()
     plt.hist(y_prob[y_true == 0], bins=bins, alpha=0.6, label="Negatives")
     plt.hist(y_prob[y_true == 1], bins=bins, alpha=0.6, label="Positives")
@@ -380,12 +383,11 @@ def plot_score_hist(y_true: np.ndarray, y_prob: np.ndarray, out_path: Path, bins
     plt.ylabel("Count")
     plt.title("Score distribution by class (test)")
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
-def plot_feature_importance(booster, out_path: Path, topn: int = 20):
+def plot_feature_importance(booster, out_gcs_uri: str, topn: int = 20):
     fmap = booster.get_score(importance_type="gain") or booster.get_score(importance_type="weight")
     items = sorted(fmap.items(), key=lambda kv: kv[1], reverse=True)[:topn]
     if not items:
@@ -397,12 +399,11 @@ def plot_feature_importance(booster, out_path: Path, topn: int = 20):
     plt.gca().invert_yaxis()
     plt.xlabel("Importance")
     plt.title(f"Top {topn} Feature Importances")
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
 
 
-def plot_metric_bars(model_metrics: Dict[str, float], baseline_metrics: Dict[str, float], title: str, out_path: Path):
+def plot_metric_bars(model_metrics: Dict[str, float], baseline_metrics: Dict[str, float], title: str, out_gcs_uri: str):
     metrics = ["precision", "recall", "accuracy", "f1"]
     model_vals = [float(model_metrics.get(m, np.nan)) for m in metrics]
     base_vals = [float(baseline_metrics.get(m, np.nan)) for m in metrics]
@@ -432,9 +433,11 @@ def plot_metric_bars(model_metrics: Dict[str, float], baseline_metrics: Dict[str
     plt.ylabel("Score")
     plt.title(title)
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    png = _fig_to_png_bytes()
+    gcs_upload_bytes(out_gcs_uri, png, content_type="image/png")
+
+
+
 
 
 # -----------------------
@@ -447,19 +450,33 @@ class TrainOutputs:
     best_params: Dict[str, Any]
     threshold_expected: float
     auc_val_mean: float
-    artifact_local_dir: str  # local path; artifact_io will upload this folder
-
+    artifact_gcs_prefix: str  # gs://.../runs/<run_id>/<label>
 
 class LabelTrainer:
-    def __init__(self, label_tag: str, out_dir: Path):
+    def __init__(
+        self,
+        label_tag: str,
+        *,
+        run_id: str,
+        gcs_model_bucket: str,
+        vertex_model_display_name: str,
+        vertex_model_registry_label: str,
+    ):
         self.label_tag = label_tag
         self.target_col = "y"
-        self.out_dir = out_dir / label_tag
-        self.out_dir.mkdir(parents=True, exist_ok=True)
 
         self.logger = get_logger(f"pts.training.{label_tag}")
         self.client = get_bq_client(project=PROJECT_ID, location=BQ_LOCATION)
-        self.run_id = latest_run_id(self.client)
+
+        # Use the provided run_id (unified with cv_build), not "latest".
+        self.run_id = run_id
+
+        # Where ALL artifacts for this label will be uploaded
+        self.gcs_prefix = f"{gcs_model_bucket.rstrip('/')}/runs/{run_id}/{label_tag}"
+
+        # For registry/manifest context
+        self.vertex_model_display_name = vertex_model_display_name
+        self.vertex_model_registry_label = vertex_model_registry_label
 
         self.folds: Dict[int, Tuple[pd.DataFrame, pd.DataFrame]] = {}
         self.test_df: Optional[pd.DataFrame] = None
@@ -502,7 +519,7 @@ class LabelTrainer:
         """Objective to maximize: mean ROC AUC across folds."""
         params = dict(
             objective="binary:logistic",
-            eval_metric="auc",
+            eval_metric="logloss",
             tree_method="hist",
             n_estimators=int(round(n_estimators)),
             max_depth=int(round(max_depth)),
@@ -513,7 +530,7 @@ class LabelTrainer:
             reg_lambda=float(reg_lambda),
             subsample=1.0,
             random_state=RANDOM_STATE,
-            n_jobs=0,
+            n_jobs=-1,
         )
         aucs = []
         for k, (tr_df, va_df) in self.folds.items():
@@ -545,8 +562,11 @@ class LabelTrainer:
         self.best_params = dict(optimizer.max["params"])
         self.best_params["max_depth"] = int(round(self.best_params["max_depth"]))
         self.best_params["n_estimators"] = int(round(self.best_params["n_estimators"]))
-        # persist locally (artifact_io will upload later)
-        (self.out_dir / "best_params.json").write_text(json.dumps(self.best_params, indent=2))
+        
+        # Upload best_params.json directly to GCS
+        best_params_uri = f"{self.gcs_prefix}/best_params.json"
+        gcs_upload_json(best_params_uri, self.best_params, indent=2)
+
 
     # ---------- final fit + calibration + threshold ----------
 
@@ -563,17 +583,22 @@ class LabelTrainer:
 
         params = dict(
             objective="binary:logistic",
-            eval_metric="auc",
+            eval_metric="logloss",
             tree_method="hist",
             subsample=1.0,
             random_state=RANDOM_STATE,
-            n_jobs=0,
+            n_jobs=-1,
             **(self.best_params or {}),
         )
         self.model = xgb.XGBClassifier(**params, scale_pos_weight=spw)
         self.model.fit(X_all, y_all)
-        # Save local model; artifact_io will upload later
-        self.model.save_model(str(self.out_dir / f"model_{self.label_tag}.json"))
+
+        # Upload model bytes (use raw format for in-memory streaming)
+        booster = self.model.get_booster()
+        model_bytes = booster.save_raw()  # binary (UBJ)
+        gcs_upload_bytes(f"{self.gcs_prefix}/model_{self.label_tag}.ubj", model_bytes, content_type="application/octet-stream")
+        
+
 
         # Validation concat for calibration & threshold selection
         Xv_list, yv_list = [], []
@@ -590,18 +615,21 @@ class LabelTrainer:
         w_val = class_weights_from_counts(y_val_all, pos_true_total, neg_true_total)
 
         # Isotonic calibration (validation-based)
-        iso = IsotonicRegression(out_of_bounds="clip")
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
         iso.fit(p_val_all, y_val_all, sample_weight=w_val)
         self.calibrator = iso
-        # Persist local calibrator; artifact_io will upload later
+        # Upload calibrator as bytes
         try:
             import joblib
-            joblib.dump(iso, self.out_dir / f"isotonic_calibrator_{self.label_tag}.joblib")
+            buf = io.BytesIO()
+            joblib.dump(iso, buf)
+            buf.seek(0)
+            gcs_upload_bytes(f"{self.gcs_prefix}/isotonic_calibrator_{self.label_tag}.joblib", buf.getvalue(), content_type="application/octet-stream")
         except Exception:
             pass
 
         # Calibrated probabilities for threshold selection
-        p_val_cal = iso.transform(p_val_all)
+        p_val_cal = _clip01(iso.transform(p_val_all))
 
         # Choose threshold maximizing EXPECTED F1 on validation
         thr, best_exp_f1 = best_expected_f1_threshold_global(
@@ -612,8 +640,12 @@ class LabelTrainer:
             grid=400,
         )
         self.val_thr_expected = float(thr)
-        # Persist threshold
-        (self.out_dir / f"threshold_expected_{self.label_tag}.txt").write_text(f"{self.val_thr_expected:.6f}\n")
+        # Upload chosen threshold
+        thr_text = f"{self.val_thr_expected:.6f}\n"
+        gcs_upload_text(f"{self.gcs_prefix}/threshold_expected_{self.label_tag}.txt", thr_text, content_type="text/plain")
+
+
+
 
     # ---------- evaluation helpers ----------
 
@@ -631,8 +663,9 @@ class LabelTrainer:
             X_va, y_va = prepare_xy_compat(va_df, self.target_col)
             y_val = y_va.astype(int)
             p_raw = self.model.predict_proba(X_va)[:, 1]
-            p_cal = self.calibrator.transform(p_raw)
-
+            p_raw = _clip01(p_raw)
+            p_cal = _clip01(self.calibrator.transform(p_raw))
+            
             pred = (p_cal >= thr).astype(int)
             tn, fp, fn, tp = confusion_matrix(y_val, pred, labels=[0, 1]).ravel()
             auc = roc_auc_score(y_val, p_cal)
@@ -732,13 +765,17 @@ class LabelTrainer:
         X_te, y_te = prepare_xy_compat(self.test_df, self.target_col)
         y_test = y_te.astype(int)
         p_raw_te = self.model.predict_proba(X_te)[:, 1]
+        p_raw_te = _clip01(p_raw_te)
         p_te = self.calibrator.transform(p_raw_te)
+        p_te = _clip01(p_te)
+        
         pred_te = (p_te >= thr).astype(int)
         tn, fp, fn, tp = confusion_matrix(y_test, pred_te, labels=[0, 1]).ravel()
         auc_te = roc_auc_score(y_test, p_te)
         pr_auc_te = average_precision_score(y_test, p_te)
         logloss_te = log_loss(y_test, p_te, labels=[0, 1])
         brier_te = brier_score_loss(y_test, p_te)
+        
         ks_te = ks_statistic(y_test.values, p_te)
         prec_te = tp / max(tp + fp, 1e-12)
         rec_te = tp / max(tp + fn, 1e-12)
@@ -830,36 +867,51 @@ class LabelTrainer:
         )
 
         metrics_df = pd.DataFrame(metrics_rows).sort_values(["split", "fold"])
-        metrics_csv_path = self.out_dir / "metrics_per_fold_and_test.csv"
-        metrics_df.to_csv(metrics_csv_path, index=False)
+        csv_bytes = metrics_df.to_csv(index=False).encode("utf-8")
+        gcs_upload_bytes(f"{self.gcs_prefix}/metrics_per_fold_and_test.csv", csv_bytes, content_type="text/csv")
         self.metrics_df = metrics_df
 
         # Plots and supplementary tables (test set)
-        plot_roc(y_test.values, p_te, thr, self.out_dir / "roc_curve_test.png")
-        plot_pr(y_test.values, p_te, thr, self.out_dir / "pr_curve_test.png")
+        plot_roc(y_test.values, p_te, thr, f"{self.gcs_prefix}/roc_curve_test.png")
+        plot_pr(y_test.values, p_te, thr, f"{self.gcs_prefix}/pr_curve_test.png")
 
         calib = self._calibration_bins(y_test.values, p_te, bins=20)
-        calib.to_csv(self.out_dir / "calibration_bins_test_observed.csv", index=False)
-        plot_calibration(calib, "mean_pred", "rate", self.out_dir / "calibration_test_observed.png", "Calibration (observed, test)")
+        gcs_upload_bytes(
+            f"{self.gcs_prefix}/calibration_bins_test_observed.csv",
+            calib.to_csv(index=False).encode("utf-8"),
+            content_type="text/csv",
+        )
+        plot_calibration(
+            calib, "mean_pred", "rate",
+            f"{self.gcs_prefix}/calibration_test_observed.png",
+            "Calibration (observed, test)"
+        )
+
 
         calib_w = self._calibration_bins_weighted(y_test.values, p_te, w_te, bins=20)
-        calib_w.to_csv(self.out_dir / "calibration_bins_test_expected.csv", index=False)
-        plot_calibration(calib_w, "mean_pred_w", "rate_w", self.out_dir / "calibration_test_expected.png", "Calibration (expected, test)")
+        gcs_upload_bytes(f"{self.gcs_prefix}/calibration_bins_test_expected.csv",
+                         calib_w.to_csv(index=False).encode("utf-8"), content_type="text/csv")
+        plot_calibration(calib_w, "mean_pred_w", "rate_w", f"{self.gcs_prefix}/calibration_test_expected.png", "Calibration (expected, test)")
 
         lift = self._lift_table(y_test.values, p_te, deciles=10)
-        lift.to_csv(self.out_dir / "lift_table_test_observed.csv", index=False)
-        plot_lift(lift, "decile", "lift", self.out_dir / "lift_test_observed.png", "Lift by decile (observed, test)")
-
+        gcs_upload_bytes(f"{self.gcs_prefix}/lift_table_test_observed.csv",
+                         lift.to_csv(index=False).encode("utf-8"), content_type="text/csv")
+        plot_lift(lift, "decile", "lift", f"{self.gcs_prefix}/lift_test_observed.png", "Lift by decile (observed, test)")
+        
         lift_w = self._lift_table_weighted(y_test.values, p_te, w_te, deciles=10)
-        lift_w.to_csv(self.out_dir / "lift_table_test_expected.csv", index=False)
-        plot_lift(lift_w, "decile", "lift_w", self.out_dir / "lift_test_expected.png", "Lift by decile (expected, test)")
+        gcs_upload_bytes(f"{self.gcs_prefix}/lift_table_test_expected.csv",
+                         lift_w.to_csv(index=False).encode("utf-8"), content_type="text/csv")
+        plot_lift(lift_w, "decile", "lift_w", f"{self.gcs_prefix}/lift_test_expected.png", "Lift by decile (expected, test)")
 
         cm_obs_model = np.array([[tn, fp], [fn, tp]], dtype=float)
         base_obs_cm = np.array([
             [base_cls_obs_te["tn"], base_cls_obs_te["fp"]],
             [base_cls_obs_te["fn"], base_cls_obs_te["tp"]],
         ], dtype=float)
-        plot_confusions_side_by_side(cm_obs_model, base_obs_cm, ("Model (observed)", "Random baseline (observed)"), self.out_dir / "confusion_test_observed_side_by_side.png", "Confusion matrices (observed, test)")
+        plot_confusions_side_by_side(cm_obs_model, base_obs_cm,
+            ("Model (observed)", "Random baseline (observed)"),
+            f"{self.gcs_prefix}/confusion_test_observed_side_by_side.png",
+            "Confusion matrices (observed, test)")
 
         cm_exp_model = np.array([
             [exp_te["exp_tn"], exp_te["exp_fp"]],
@@ -869,11 +921,15 @@ class LabelTrainer:
             [base_cls_exp_te["tn"], base_cls_exp_te["fp"]],
             [base_cls_exp_te["fn"], base_cls_exp_te["tp"]],
         ], dtype=float)
-        plot_confusions_side_by_side(cm_exp_model, cm_exp_base, ("Model (expected)", "Random baseline (expected)"), self.out_dir / "confusion_test_expected_side_by_side.png", "Confusion matrices (expected, test)")
+        plot_confusions_side_by_side(cm_exp_model, cm_exp_base,
+            ("Model (expected)", "Random baseline (expected)"),
+            f"{self.gcs_prefix}/confusion_test_expected_side_by_side.png",
+            "Confusion matrices (expected, test)")
 
         model_obs_metrics = {"precision": prec_te, "recall": rec_te, "accuracy": acc_te, "f1": f1_te}
         base_obs_metrics = {k: base_cls_obs_te[k] for k in ["precision", "recall", "accuracy", "f1"]}
-        plot_metric_bars(model_obs_metrics, base_obs_metrics, "Classification metrics (observed, test)", self.out_dir / "classification_bars_test_observed.png")
+        plot_metric_bars(model_obs_metrics, base_obs_metrics, "Classification metrics (observed, test)",
+            f"{self.gcs_prefix}/classification_bars_test_observed.png")
 
         model_exp_metrics = {
             "precision": exp_te["exp_precision"],
@@ -887,11 +943,12 @@ class LabelTrainer:
             "accuracy": base_cls_exp_te["accuracy"],
             "f1": base_cls_exp_te["f1"],
         }
-        plot_metric_bars(model_exp_metrics, base_exp_metrics, "Classification metrics (expected, test)", self.out_dir / "classification_bars_test_expected.png")
+        plot_metric_bars(model_exp_metrics, base_exp_metrics, "Classification metrics (expected, test)",
+            f"{self.gcs_prefix}/classification_bars_test_expected.png")
 
-        plot_score_hist(y_test.values, p_te, self.out_dir / "score_hist_test.png")
+        plot_score_hist(y_test.values, p_te, f"{self.gcs_prefix}/score_hist_test.png")
         try:
-            plot_feature_importance(self.model.get_booster(), self.out_dir / "feature_importance_top20.png", topn=20)
+            plot_feature_importance(self.model.get_booster(), f"{self.gcs_prefix}/feature_importance_top20.png", topn=20)
         except Exception:
             pass
 
@@ -955,19 +1012,17 @@ class LabelTrainer:
             "run_id": self.run_id,
         }
 
-        summary_path = self.out_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2))
+        gcs_upload_json(f"{self.gcs_prefix}/summary.json", summary, indent=2)
         self.logger.info(
             "Saved evaluation artifacts for label=%s at %s",
             self.label_tag,
-            self.out_dir,
+            self.gcs_prefix,
         )
 
         return {
             "metrics_df": metrics_df,
-            "metrics_csv": str(metrics_csv_path),
             "summary": summary,
-            "summary_path": str(summary_path),
+            # We no longer return local paths; all artifacts live under self.gcs_prefix
         }
 
     def _natural_counts(self, split: str, fold: int) -> Tuple[int, int, int]:
@@ -1055,7 +1110,7 @@ class LabelTrainer:
             best_params=self.best_params or {},
             threshold_expected=self.val_thr_expected or 0.5,
             auc_val_mean=auc_mean,
-            artifact_local_dir=str(self.out_dir),
+            artifact_gcs_prefix=str(self.gcs_prefix),
         )
 
 
@@ -1084,12 +1139,14 @@ def run_training(
     Returns a summary dict with per-label outputs. Artifact uploads and metric
     persistence occur in later steps (artifact_io, metrics_to_bq).
     """
-    global PROJECT_ID, BQ_LOCATION, BQ_DATASET, TABLE_DATA, TABLE_META
+    global PROJECT_ID, BQ_LOCATION, BQ_DATASET, TABLE_DATA, TABLE_META, TABLE_PREP
     PROJECT_ID = project_id
     BQ_LOCATION = region
     BQ_DATASET = dataset
     TABLE_DATA = f"{PROJECT_ID}.{BQ_DATASET}.{train_table}"
     TABLE_META = f"{PROJECT_ID}.{BQ_DATASET}.cv_build_metadata"
+    TABLE_PREP = f"{PROJECT_ID}.{BQ_DATASET}.prep_metadata"
+
 
     logger = get_logger("pts.training.train")
 
@@ -1101,45 +1158,52 @@ def run_training(
     if primary_label and primary_label not in labels:
         labels.insert(0, primary_label)
 
-    out_root = Path("runs") / run_id
-    out_root.mkdir(parents=True, exist_ok=True)
 
     results: Dict[str, Any] = {"run_id": run_id, "labels": {}}
 
     for tag in labels:
         logger.info("=== Training label: %s ===", tag)
-        trainer = LabelTrainer(label_tag=tag, out_dir=out_root)
+        trainer = LabelTrainer(
+            label_tag=tag,
+            run_id=run_id,
+            gcs_model_bucket=gcs_model_bucket,
+            vertex_model_display_name=vertex_model_display_name,
+            vertex_model_registry_label=vertex_model_registry_label,
+        )
         trainer.load()
+    
         logger.info("Bayesian optimization starting...")
         trainer.bayes_optimize()
+    
         logger.info("Fitting final model + calibration + threshold selection...")
         trainer.fit_final()
+    
         eval_outputs = trainer.evaluate_and_save()
         summary = trainer.summary()
+    
         results["labels"][tag] = {
             "best_params": summary.best_params,
             "threshold_expected": summary.threshold_expected,
             "auc_val_mean": summary.auc_val_mean,
-            "artifact_local_dir": summary.artifact_local_dir,
-            "metrics_csv": eval_outputs.get("metrics_csv"),
-            "summary_json": eval_outputs.get("summary_path"),
+            "artifact_gcs_prefix": summary.artifact_gcs_prefix,
         }
-
-        # Optional: if artifact_io is present (added in a later step), upload artifacts and register model
+    
+        # Register version & write manifest pointing at GCS artifacts
         if artifact_io is not None:
             try:
-                artifact_io.save_and_register_label_run(
+                artifact_io.write_manifest_and_register_existing(
                     label_tag=tag,
-                    local_dir=summary.artifact_local_dir,
+                    run_id=run_id,
                     gcs_model_bucket=gcs_model_bucket,
                     vertex_model_display_name=vertex_model_display_name,
                     vertex_model_registry_label=vertex_model_registry_label,
-                    run_id=run_id,
+                    best_params=summary.best_params,
+                    threshold=summary.threshold_expected,
                 )
             except Exception as e:
-                logger.warning("artifact_io.save_and_register_label_run failed: %s", e)
-
-        # Optional: write metrics to BQ if available (later step)
+                logger.warning("artifact_io.write_manifest_and_register_existing failed: %s", e)
+    
+        # Persist metrics to BigQuery
         if metrics_to_bq is not None:
             try:
                 metrics_to_bq.write_training_summary(
@@ -1161,7 +1225,9 @@ def run_training(
                         metrics_df=metrics_df,
                     )
             except Exception as e:
-                logger.warning("metrics_to_bq.write_training_summary failed: %s", e)
+                logger.warning("metrics_to_bq write failed: %s", e)
+
+
 
     logger.info("Training summary: %s", json.dumps(results, indent=2))
     return results

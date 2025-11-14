@@ -41,6 +41,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     # Advanced / debug
     p.add_argument("--dry_run_sql", action="store_true", help="If set, only validates SQL without writing tables")
+    p.add_argument("--run_id", default=None, help="Override run id; if omitted a new one is generated")
+
 
     return p.parse_args(argv)
 
@@ -50,7 +52,7 @@ def main(argv=None) -> None:
     cfg: Dict[str, Any] = load_env_config()
 
     logger = get_logger("pts.training.entrypoint", level=args.log_level or cfg.get("log_level", "INFO"))
-    run_id = make_run_id()
+    run_id = args.run_id or make_run_id()
 
     logger.info("=== PTS Training Entrypoint ===")
     logger.info("Run ID: %s  |  Timestamp: %s", run_id, utcnow_iso())
@@ -70,6 +72,7 @@ def main(argv=None) -> None:
 
     # 1) Build / refresh the training dataset in BigQuery
     logger.info("Step 1/2: Building training data in BigQuery...")
+
     cv_params = {
         "project_id": cfg["project_id"],
         "region": cfg["region"],
@@ -80,6 +83,7 @@ def main(argv=None) -> None:
         "freeze_date": args.freeze_date,
         "dne_start": args.dne_start,
         "cap_wall1_offer_start": args.cap_wall1_offer_start,
+        "run_id": run_id,                      # <-- pass in the generated run_id
         "dry_run_sql": bool(args.dry_run_sql),
     }
     logger.info("cv_build params: %s", json.dumps({k: v for k, v in cv_params.items() if k != 'dry_run_sql'}, indent=2))
@@ -102,7 +106,7 @@ def main(argv=None) -> None:
         "vertex_model_display_name": cfg.get("vertex_model_display_name", "pts_xgb_model"),
         "vertex_model_registry_label": cfg.get("vertex_model_registry_label", "propensity_to_subscribe"),
         "artifact_repo": cfg.get("artifact_repo"),
-        "run_id": run_id,
+        "run_id": run_id,                      # <-- same run_id gets used in training
         "primary_label": args.primary_label,
     }
     logger.info("train params: %s", json.dumps({k: v for k, v in train_params.items() if k != 'artifact_repo'}, indent=2))
