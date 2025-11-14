@@ -15,9 +15,16 @@ Authentication
 
 from __future__ import annotations
 
+import inspect
+import logging
+import re
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional
 
 from google.cloud import aiplatform
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
@@ -32,6 +39,18 @@ def init_ai(project_id: str, region: str) -> None:
 # ---------------------------------------------------------------------
 # Registration / metadata
 # ---------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _model_upload_accepts_metadata() -> bool:
+    """Return True if the installed Vertex AI SDK supports the metadata kwarg."""
+    try:
+        params = inspect.signature(aiplatform.Model.upload).parameters
+    except (TypeError, ValueError):
+        # If inspect.signature() cannot determine the signature we assume support;
+        # uploading will fail later and surface a clear error.
+        return True
+    return "metadata" in params
+
 
 def register_model_version(
     *,
@@ -57,16 +76,63 @@ def register_model_version(
     Returns:
         aiplatform.Model (the newly registered version)
     """
-    model = aiplatform.Model.upload(
-        display_name=display_name,
-        artifact_uri=artifact_uri,
-        serving_container_image_uri=serving_image_uri,
-        labels=labels or {},
-        metadata=metadata or {},
-        version_aliases=list(version_aliases or []),
+    raw_aliases = list(version_aliases or [])
+    sanitized_aliases: List[str] = []
+    alias_changes: Dict[str, str] = {}
+    for alias in raw_aliases:
+        sanitized = normalize_version_alias(alias)
+        if sanitized != alias:
+            alias_changes[alias] = sanitized
+        sanitized_aliases.append(sanitized)
+
+    if alias_changes:
+        logger.info(
+            "Sanitized model version aliases due to Vertex constraints: %s",
+            ", ".join(f"{old!r}-> {new!r}" for old, new in alias_changes.items()),
+        )
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped_aliases: List[str] = []
+    for alias in sanitized_aliases:
+        if alias not in seen:
+            seen.add(alias)
+            deduped_aliases.append(alias)
+
+    upload_kwargs = {
+        "display_name": display_name,
+        "artifact_uri": artifact_uri,
+        "serving_container_image_uri": serving_image_uri,
+        "labels": labels or {},
+        "version_aliases": deduped_aliases,
         # No need to set explanation or predict schemata for batch-only workflows.
-    )
+    }
+
+    if metadata:
+        if _model_upload_accepts_metadata():
+            upload_kwargs["metadata"] = metadata
+        else:
+            logger.warning(
+                "Vertex AI SDK does not accept model metadata; dropping keys: %s",
+                sorted(metadata.keys()),
+            )
+
+    model = aiplatform.Model.upload(**upload_kwargs)
     return model
+
+
+def normalize_version_alias(value: str, *, prefix: str = "a") -> str:
+    """Return a Vertex-compatible version alias string."""
+
+    safe = value.lower()
+    safe = re.sub(r"[^a-z0-9-]", "-", safe)
+    safe = re.sub(r"-+", "-", safe)
+    safe = safe.strip("-")
+    if not safe:
+        safe = prefix
+    if not safe[0].isalpha():
+        safe = f"{prefix}{safe}"
+    return safe[:63]
 
 
 # ---------------------------------------------------------------------
@@ -125,14 +191,16 @@ def resolve_production_version_for_label(display_name: str, label_tag: str) -> O
     if not candidates:
         return None
 
-    wanted_alias = f"production-{label_tag}".lower()
+    wanted_alias = normalize_version_alias(f"production-{label_tag}")
     for model in candidates:
         aliases = set(alias.lower() for alias in (model.version_aliases or []))
+        aliases.update(normalize_version_alias(alias) for alias in (model.version_aliases or []))
         if wanted_alias in aliases:
             return model
 
     for model in candidates:
         aliases = set(alias.lower() for alias in (model.version_aliases or []))
+        aliases.update(normalize_version_alias(alias) for alias in (model.version_aliases or []))
         if "production" in aliases:
             return model
 
