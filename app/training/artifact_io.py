@@ -52,11 +52,17 @@ def _collect_label_files(local_dir: Path, label_tag: str) -> Dict[str, Path]:
     Return a dict of expected files if present.
     """
     files = {
-        "model": local_dir / f"model_{label_tag}.json",
+        "model": local_dir / f"model_{label_tag}.ubj",
+        "vertex_model": local_dir / "model.bst",
         "calibrator": local_dir / f"isotonic_calibrator_{label_tag}.joblib",
         "best_params": local_dir / "best_params.json",
         "threshold": local_dir / f"threshold_expected_{label_tag}.txt",
     }
+
+    # Backward compatibility: fall back to legacy JSON artifact if present.
+    legacy_json = local_dir / f"model_{label_tag}.json"
+    if legacy_json.exists() and not files["model"].exists():
+        files["model"] = legacy_json
     return files
 
 
@@ -74,7 +80,7 @@ def save_and_register_label_run(
 
     Args:
         label_tag: e.g., "cap_30d"
-        local_dir: path created by train.py for this label (contains model_*.json etc.)
+        local_dir: path created by train.py for this label (contains model_*.ubj etc.)
         gcs_model_bucket: e.g., "gs://economedia-pts-models"
         vertex_model_display_name: e.g., "pts_xgb_model"
         vertex_model_registry_label: e.g., "propensity_to_subscribe" (used as a label key/value)
@@ -174,6 +180,7 @@ def write_manifest_and_register_existing(
     Assumes artifacts already exist under:
       gs://<bucket>/runs/<run_id>/<label_tag>/
       - model_<label>.ubj
+      - model.bst
       - isotonic_calibrator_<label>.joblib
       - best_params.json
       - threshold_expected_<label>.txt
@@ -193,6 +200,7 @@ def write_manifest_and_register_existing(
 
     files = {
         "model": _gcs_join(gcs_prefix, f"model_{label_tag}.ubj"),
+        "vertex_model": _gcs_join(gcs_prefix, "model.bst"),
         "calibrator": _gcs_join(gcs_prefix, f"isotonic_calibrator_{label_tag}.joblib"),
         "best_params": _gcs_join(gcs_prefix, "best_params.json"),
         "threshold": _gcs_join(gcs_prefix, f"threshold_expected_{label_tag}.txt"),

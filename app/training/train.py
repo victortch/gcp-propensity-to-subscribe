@@ -16,8 +16,10 @@ in later steps (artifact_io.py, metrics_to_bq.py), without changing training mat
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +46,6 @@ from sklearn.metrics import (
 from google.cloud import bigquery
 
 from app.common.io import get_bq_client, gcs_upload_bytes, gcs_upload_text, gcs_upload_json
-import io
 from app.common.preprocessing import prepare_xy_compat
 from app.common.utils import get_logger
 
@@ -596,7 +597,22 @@ class LabelTrainer:
         # Upload model bytes (use raw format for in-memory streaming)
         booster = self.model.get_booster()
         model_bytes = booster.save_raw()  # binary (UBJ)
-        gcs_upload_bytes(f"{self.gcs_prefix}/model_{self.label_tag}.ubj", model_bytes, content_type="application/octet-stream")
+        gcs_upload_bytes(
+            f"{self.gcs_prefix}/model_{self.label_tag}.ubj",
+            model_bytes,
+            content_type="application/octet-stream",
+        )
+
+        # Vertex AI Model Registry expects a canonical model file named model.bst/model.pkl/etc.
+        # Create a temporary .bst copy alongside the UBJ artifact so registry validation passes.
+        with tempfile.NamedTemporaryFile(suffix=".bst") as tmp_model:
+            booster.save_model(tmp_model.name)
+            tmp_model.seek(0)
+            gcs_upload_bytes(
+                f"{self.gcs_prefix}/model.bst",
+                tmp_model.read(),
+                content_type="application/octet-stream",
+            )
 
         # Persist feature order for strict inference parity
         gcs_upload_json(f"{self.gcs_prefix}/feature_names.json", list(X_all.columns))
