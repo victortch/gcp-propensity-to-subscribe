@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import pandas as pd
 import xgboost as xgb
 from sklearn.isotonic import IsotonicRegression
@@ -40,59 +41,13 @@ from app.common.registry import (
     resolve_production_version_for_label,
     get_artifact_uri,
 )
-from app.common.preprocessing import drop_meta_cols
+from app.common.preprocessing import prepare_features_like_training
 from app.common.utils import get_logger
 
 try:
     import yaml
 except ImportError:  # pragma: no cover
     yaml = None
-
-
-# ---------------------------------------------------------------------
-# Small helpers (match training feature prep without labels)
-# ---------------------------------------------------------------------
-
-def _prep_features_like_training(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Mirror training's prepare_xy_compat and cv_build.load_base_dataframe post-processing:
-      - Drop meta cols + 'scoring_date'
-      - If demographics flags are missing, synthesize them exactly like training:
-            * parse first integer token from the string
-            * fill NA with 0
-            * add *_missing / *_invalid flags
-      - Cast numerics to float32; non-numerics to categorical codes -> float32; fillna 0.0
-    """
-    dfx = df.copy()
-
-    # Synthesize demographic features like training if they are not already present.
-    # Training logic reference: app/training/cv_build.py load_base_dataframe() step 4.  <-- keeps parity
-    for c in ["education", "workpos", "sex"]:
-        if c in dfx.columns:
-            miss_col = f"{c}_missing"
-            inv_col  = f"{c}_invalid"
-            # Only add if not present (idempotent and backward-compatible with future BQ updates)
-            if miss_col not in dfx.columns or inv_col not in dfx.columns:
-                s = dfx[c].astype("string")
-                miss = s.isna() | s.str.strip().eq("")
-                token = s.str.extract(r"(-?\d+)")[0]
-                num = pd.to_numeric(token, errors="coerce")
-                # Match training fill and dtype; downstream we cast to float32 anyway
-                dfx[c] = num.fillna(0).astype("Int64")
-                dfx[miss_col] = miss.astype("Int8")
-                dfx[inv_col]  = ((~miss) & num.isna()).astype("Int8")
-
-    # Drop meta cols; exclude 'scoring_date' explicitly (training uses 'date', which is dropped)
-    X = drop_meta_cols(dfx, extra_drop=["scoring_date"])
-
-    # Cast per training rules
-    for c in X.columns:
-        if pd.api.types.is_numeric_dtype(X[c]):
-            X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
-        else:
-            X[c] = X[c].astype("category").cat.codes.astype("float32")
-
-    return X.fillna(0.0)
 
 
 def _align_to_feature_names(X: pd.DataFrame, feature_names: Optional[List[str]]) -> pd.DataFrame:
@@ -126,7 +81,7 @@ class LabelArtifacts:
     manifest: Dict[str, Any]
 
 
-def _parse_thresholds_policy(path: str) -> Tuple[float, Dict[str, float]]:
+def _parse_thresholds_policy(path: str) -> Tuple[Optional[float], Dict[str, float]]:
     """Return fallback threshold and per-label overrides."""
     if yaml is None:
         raise RuntimeError("PyYAML is required to read thresholds_policy.yaml")
@@ -135,7 +90,8 @@ def _parse_thresholds_policy(path: str) -> Tuple[float, Dict[str, float]]:
         cfg = yaml.safe_load(f) or {}
 
     default_cfg = cfg.get("default", {})
-    fallback = float(default_cfg.get("fallback_threshold", 0.5))
+    fallback_raw = default_cfg.get("fallback_threshold")
+    fallback: Optional[float] = None if fallback_raw is None else float(fallback_raw)
 
     overrides: Dict[str, float] = {}
     for label, body in (cfg.get("labels") or {}).items():
@@ -152,7 +108,7 @@ def _load_label_artifacts(
     label_tag: str,
     *,
     threshold_override: Optional[float],
-    fallback_threshold: float,
+    fallback_threshold: Optional[float],
 ) -> LabelArtifacts:
     """
     Resolve the production version for this label, read its manifest.json,
@@ -187,14 +143,18 @@ def _load_label_artifacts(
 
     files = manifest.get("files", {}) or {}
 
-    # Model bytes (UBJ) -> local cache -> load into XGBClassifier
-    model_uri = files.get("model") or f"{label_prefix}/model_{label_tag}.ubj"
     tmp_dir = Path(".local_infer_cache") / label_tag
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    local_model = tmp_dir / Path(model_uri).name
-    gcs_download_file(model_uri, local_model)
-    model = xgb.XGBClassifier()
-    model.load_model(str(local_model))
+
+    # Load the persisted estimator (joblib only, aligned with training)
+    model: xgb.XGBClassifier
+    joblib_uri = files.get("model_joblib") or f"{label_prefix}/model_{label_tag}.joblib"
+    local_joblib = tmp_dir / Path(joblib_uri).name
+    gcs_download_file(joblib_uri, local_joblib)
+    loaded_model = joblib.load(local_joblib)
+    if not isinstance(loaded_model, xgb.XGBClassifier):
+        raise TypeError("Loaded model is not an XGBClassifier")
+    model = loaded_model
 
     # Optional calibrator
     calibrator: Optional[IsotonicRegression] = None
@@ -202,8 +162,6 @@ def _load_label_artifacts(
     try:
         local_cal = tmp_dir / Path(calib_uri).name
         gcs_download_file(calib_uri, local_cal)
-        import joblib
-
         calibrator = joblib.load(local_cal)
     except Exception:
         calibrator = None
@@ -228,6 +186,10 @@ def _load_label_artifacts(
             except Exception:
                 threshold = None
         if threshold is None:
+            if fallback_threshold is None:
+                raise RuntimeError(
+                    "No trained threshold available; ensure training artifacts include the expected F1 threshold."
+                )
             threshold = float(fallback_threshold)
             threshold_source = "fallback"
 
@@ -348,7 +310,7 @@ def _score_one_label(
     meta = feats_df[user_cols].copy()
 
     # Build X like training
-    X = _prep_features_like_training(feats_df)
+    X = prepare_features_like_training(feats_df)
 
     # Align to training feature order using persisted feature_names (preferred)
     feat_names = label_art.feature_names
