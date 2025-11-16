@@ -52,7 +52,8 @@ def _collect_label_files(local_dir: Path, label_tag: str) -> Dict[str, Path]:
     Return a dict of expected files if present.
     """
     return {
-        "model_joblib": local_dir / f"model_{label_tag}.joblib",
+        # Model artifact naming aligns with training (model.joblib shared across labels)
+        "model_joblib": local_dir / "model.joblib",
         "calibrator": local_dir / f"isotonic_calibrator_{label_tag}.joblib",
         "best_params": local_dir / "best_params.json",
         "threshold": local_dir / f"threshold_expected_{label_tag}.txt",
@@ -191,7 +192,8 @@ def write_manifest_and_register_existing(
     gcs_prefix = f"{gcs_model_bucket.rstrip('/')}/runs/{run_id}/{label_tag}"
 
     files = {
-        "model_joblib": _gcs_join(gcs_prefix, f"model_{label_tag}.joblib"),
+        # model.joblib matches the artifact emitted by training
+        "model_joblib": _gcs_join(gcs_prefix, "model.joblib"),
         "calibrator": _gcs_join(gcs_prefix, f"isotonic_calibrator_{label_tag}.joblib"),
         "best_params": _gcs_join(gcs_prefix, "best_params.json"),
         "threshold": _gcs_join(gcs_prefix, f"threshold_expected_{label_tag}.txt"),
