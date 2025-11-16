@@ -19,7 +19,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from bayes_opt import BayesianOptimization
+import joblib
 import xgboost as xgb
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
@@ -594,25 +594,15 @@ class LabelTrainer:
         self.model = xgb.XGBClassifier(**params, scale_pos_weight=spw)
         self.model.fit(X_all, y_all)
 
-        # Upload model bytes (use raw format for in-memory streaming)
-        booster = self.model.get_booster()
-        model_bytes = booster.save_raw()  # binary (UBJ)
+        # Persist full estimator as joblib for direct reuse during inference
+        model_buf = io.BytesIO()
+        joblib.dump(self.model, model_buf)
+        model_buf.seek(0)
         gcs_upload_bytes(
-            f"{self.gcs_prefix}/model_{self.label_tag}.ubj",
-            model_bytes,
+            f"{self.gcs_prefix}/model_{self.label_tag}.joblib",
+            model_buf.getvalue(),
             content_type="application/octet-stream",
         )
-
-        # Vertex AI Model Registry expects a canonical model file named model.bst/model.pkl/etc.
-        # Create a temporary .bst copy alongside the UBJ artifact so registry validation passes.
-        with tempfile.NamedTemporaryFile(suffix=".bst") as tmp_model:
-            booster.save_model(tmp_model.name)
-            tmp_model.seek(0)
-            gcs_upload_bytes(
-                f"{self.gcs_prefix}/model.bst",
-                tmp_model.read(),
-                content_type="application/octet-stream",
-            )
 
         # Persist feature order for strict inference parity
         gcs_upload_json(f"{self.gcs_prefix}/feature_names.json", list(X_all.columns))
@@ -637,14 +627,14 @@ class LabelTrainer:
         iso.fit(p_val_all, y_val_all, sample_weight=w_val)
         self.calibrator = iso
         # Upload calibrator as bytes
-        try:
-            import joblib
-            buf = io.BytesIO()
-            joblib.dump(iso, buf)
-            buf.seek(0)
-            gcs_upload_bytes(f"{self.gcs_prefix}/isotonic_calibrator_{self.label_tag}.joblib", buf.getvalue(), content_type="application/octet-stream")
-        except Exception:
-            pass
+        buf = io.BytesIO()
+        joblib.dump(iso, buf)
+        buf.seek(0)
+        gcs_upload_bytes(
+            f"{self.gcs_prefix}/isotonic_calibrator_{self.label_tag}.joblib",
+            buf.getvalue(),
+            content_type="application/octet-stream",
+        )
 
         # Calibrated probabilities for threshold selection
         p_val_cal = _clip01(iso.transform(p_val_all))
