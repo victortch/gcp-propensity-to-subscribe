@@ -148,7 +148,7 @@ def _load_label_artifacts(
 
     # Load the persisted estimator (joblib only, aligned with training)
     model: xgb.XGBClassifier
-    joblib_uri = files.get("model_joblib") or f"{label_prefix}/model_{label_tag}.joblib"
+    joblib_uri = files.get("model_joblib") or f"{label_prefix}/model.joblib"
     local_joblib = tmp_dir / Path(joblib_uri).name
     gcs_download_file(joblib_uri, local_joblib)
     loaded_model = joblib.load(local_joblib)

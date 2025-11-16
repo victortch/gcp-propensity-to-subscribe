@@ -599,7 +599,7 @@ class LabelTrainer:
         joblib.dump(self.model, model_buf)
         model_buf.seek(0)
         gcs_upload_bytes(
-            f"{self.gcs_prefix}/model_{self.label_tag}.joblib",
+            f"{self.gcs_prefix}/model.joblib",
             model_buf.getvalue(),
             content_type="application/octet-stream",
         )
